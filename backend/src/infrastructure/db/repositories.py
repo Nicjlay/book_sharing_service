@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import select, update
@@ -82,3 +83,28 @@ class BookRepository:
             book_id=book_id, user_id=user_id, status_to=status, comment=comment
         )
         self.session.add(history_entry)
+
+    async def issue_book(self, book_id: int, due_date: datetime):
+        stmt = (
+            update(BookTable)
+            .where(BookTable.id == book_id)
+            .values(status=BookStatus.BORROWED, return_due_date=due_date)
+        )
+        await self.session.execute(stmt)
+        await self.session.commit()
+
+    async def update_book_image(self, book_id: int, image_path: str):
+        """
+        Привязывает путь к изображению к книге в базе данных.
+        """
+        # Создаем запрос на обновление
+        stmt = (
+            update(BookTable)
+            .where(BookTable.id == book_id)
+            .values(image_path=image_path)
+        )
+
+        # Выполняем
+        await self.session.execute(stmt)
+        # Фиксируем изменения в БД
+        await self.session.commit()
