@@ -6,6 +6,7 @@ class BookStatus(str, Enum):
     AVAILABLE = "available"
     RESERVED = "reserved"
     BORROWED = "borrowed"
+    OVERDUE = "overdue"
 
 @dataclass
 class Book:

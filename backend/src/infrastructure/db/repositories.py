@@ -1,7 +1,10 @@
-from sqlalchemy import select
+from typing import Optional
+
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from infrastructure.db.models import UserTable, BookTable
-from domain.models import Book
+from infrastructure.db.models import UserTable, BookTable, BookHistoryTable
+from domain.models import Book, BookStatus
+
 
 class UserRepository:
     def __init__(self, session: AsyncSession):
@@ -41,3 +44,41 @@ class BookRepository:
         query = select(BookTable)
         result = await self.session.execute(query)
         return result.scalars().all()
+
+    async def get_book_by_id(self, book_id: int) -> Optional[BookTable]:
+        return await self.session.get(BookTable, book_id)
+
+    async def update_book_status(self, book_id: int, new_status: BookStatus):
+        stmt = (
+            update(BookTable)
+            .where(BookTable.id == book_id)
+            .values(status=new_status)
+        )
+        await self.session.execute(stmt)
+        await self.session.commit()
+
+    async def get_my_books(self, user_id: int):
+        query = select(BookTable).where(BookTable.id == user_id)
+        result = await self.session.execute(query)
+        return result.scalars().all()
+
+    async def search_books(self, title: str = None, genre: str = None, status: BookStatus = None):
+        """Полнотекстовый поиск и фильтры (Пункт 4.3 ТЗ)"""
+        query = select(BookTable)
+
+        if title:
+            query = query.where(BookTable.title.ilike(f"%{title}%"))
+        if genre:
+            query = query.where(BookTable.genre == genre)
+        if status:
+            query = query.where(BookTable.status == status)
+
+        result = await self.session.execute(query)
+        return result.scalars().all()
+
+    async def log_history(self, book_id: int, user_id: int, status: BookStatus, comment: str = None):
+        """Запись в журнал истории"""
+        history_entry = BookHistoryTable(
+            book_id=book_id, user_id=user_id, status_to=status, comment=comment
+        )
+        self.session.add(history_entry)
