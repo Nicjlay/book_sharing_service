@@ -57,9 +57,11 @@ class BookRead(BookBase):
     is_deleted: bool
     created_at: datetime
 
-    # Дополнительные поля для UI
+    # Дополнительные поля для UI (заполняются в эндпоинтах)
     owner_username: Optional[str] = None
     owner_full_name: Optional[str] = None
+    borrower_username: Optional[str] = None
+    borrower_full_name: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -84,6 +86,7 @@ class GenreList(BaseModel):
 # --- История ---
 class BookHistoryRead(BaseModel):
     id: int
+    book_id: int
     action_date: datetime
     user_id: int
     status_to: BookStatus
@@ -97,7 +100,7 @@ class BookHistoryRead(BaseModel):
 # --- Запросы действий ---
 class ReservationRequest(BaseModel):
     user_id: int
-    days: int = 14
+    days: int = 14  # Дефолт: 2 недели
 
 
 class ApproveRequest(BaseModel):
@@ -113,7 +116,7 @@ class RejectRequest(BaseModel):
 # --- Webhook Payload (Сервер -> Бот) ---
 class NotificationPayload(BaseModel):
     """Формат данных, которые сервер отправляет боту по HTTP"""
-    user_id: int
+    user_id: int  # -1 для всех админов, 0 для группы
     type: NotificationType
     message: str
     book_id: Optional[int] = None

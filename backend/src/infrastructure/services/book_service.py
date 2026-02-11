@@ -32,8 +32,11 @@ class LibraryService:
             comment="Книга добавлена в каталог"
         )
 
-        # Уведомляем группу (через notification service заглушку,
-        # реально бот сам это сделает, получив ответ 201)
+        # Уведомление в группу о новой книге (ТЗ 3.1.3)
+        owner = await self.user_repo.get_by_id(book_in.owner_id)
+        owner_username = f"@{owner.username}" if owner.username else owner.full_name
+        await notification_service.notify_new_book(book, owner_username)
+
         return book.id
 
     async def edit_book(self, book_id: int, user_id: int, update_data: BookUpdate):
@@ -49,6 +52,9 @@ class LibraryService:
         # Формируем текст изменений для истории
         changes = []
         if update_data.title: changes.append("название")
+        if update_data.author: changes.append("автор")
+        if update_data.description: changes.append("описание")
+        if update_data.genre: changes.append("жанр")
         if update_data.image_path: changes.append("фото")
         comment = f"Изменено: {', '.join(changes)}" if changes else "Редактирование данных"
 
@@ -99,12 +105,13 @@ class LibraryService:
             f"Запрос брони до {wanted_date}"
         )
 
-        # Здесь бот должен отправить сообщение админу.
-        # API просто возвращает ОК, триггер админа на стороне бота или notification_service
+        # Отправляем уведомление админу о новой заявке (ТЗ 3.2.3)
+        await notification_service.notify_admin_about_reservation(book, user_id, days)
+
         return {"status": "reserved_pending_approval"}
 
     async def approve_reservation(self, book_id: int, admin_id: int, due_date: datetime):
-        """Шаг 3.3 ТЗ: Админ подтверждает выдачу"""
+        """Шаг 3.2.3 ТЗ: Админ подтверждает выдачу"""
         book = await self.book_repo.get_book_by_id(book_id)
         if not book or book.status != BookStatus.RESERVED:
             raise HTTPException(status_code=400, detail="Книга не ожидает подтверждения")
@@ -116,11 +123,15 @@ class LibraryService:
             f"Выдача подтверждена до {due_date.date()}"
         )
 
+        # Уведомляем пользователя об одобрении (ТЗ 3.2.3)
         await notification_service.notify_reservation_approved(book)
         return book
 
     async def reject_reservation(self, book_id: int, admin_id: int, reason: str):
         book = await self.book_repo.get_book_by_id(book_id)
+        if not book:
+            raise HTTPException(status_code=404, detail="Книга не найдена")
+
         borrower_id = book.borrower_id
 
         # Сброс в Available
@@ -131,6 +142,7 @@ class LibraryService:
             f"Отказ в выдаче: {reason}"
         )
 
+        # Уведомляем пользователя об отказе
         if borrower_id:
             await notification_service.notify_reservation_rejected(book, borrower_id, reason)
 
@@ -139,7 +151,7 @@ class LibraryService:
     async def return_book(self, book_id: int, user_id: int, is_admin: bool, photo: UploadFile = None):
         book = await self.book_repo.get_book_by_id(book_id)
         if not book:
-            raise HTTPException(status_code=404)
+            raise HTTPException(status_code=404, detail="Книга не найдена")
 
         # Проверка прав: вернуть может заемщик, владелец или админ
         is_borrower = book.borrower_id == user_id
@@ -148,13 +160,10 @@ class LibraryService:
         if not (is_borrower or is_owner or is_admin):
             raise HTTPException(status_code=403, detail="Нет прав на возврат")
 
-        # Обработка фото
+        # Обработка фото (ТЗ 3.3.2)
         photo_path = None
         if photo:
             photo_path = await image_service.process_and_save(photo)
-        elif not is_admin:
-            # ТЗ: можно пропустить, но заглушку ставить не надо, просто NULL
-            pass
 
         previous_borrower = book.borrower_id
 
@@ -171,7 +180,7 @@ class LibraryService:
 
         # 3. Уведомление Владельцу (ТЗ 3.3.3)
         # Если вернул не владелец, уведомляем его
-        if not is_owner:
+        if not is_owner and book.owner_id:
             await notification_service.notify_owner_about_return(book, user_id, photo_path)
 
         # 4. Обработка Waitlist (ТЗ 3.2.2 -> 4.3)
