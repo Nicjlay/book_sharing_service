@@ -6,3 +6,4 @@ asyncpg==0.31.0
 pydantic-settings==2.8.1
 Pillow==10.4.0
 python-multipart==0.0.9
+httpx==0.28.1

@@ -1,7 +1,7 @@
 from pydantic import BaseModel, Field, validator
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime
-from .domain_models import BookStatus
+from .domain_models import BookStatus, NotificationType
 
 
 # --- Общие части ---
@@ -16,8 +16,8 @@ class BookBase(BaseModel):
 
     @validator('author')
     def validate_author(cls, v):
-        # ТЗ: "Введите фамилию и имя... если одно слово - уточните"
-        # API не может "уточнить", но может отклонить, чтобы бот перезапросил
+        # Валидация на стороне сервера (страховка).
+        # Основную проверку UI делает бот, но БД не должна принимать мусор.
         parts = v.strip().split()
         if len(parts) < 2:
             raise ValueError("Введите полное имя и фамилию автора")
@@ -55,12 +55,29 @@ class BookRead(BookBase):
     borrower_id: Optional[int] = None
     return_due_date: Optional[datetime] = None
     is_deleted: bool
+    created_at: datetime
 
-    # Для отображения в каталоге
+    # Дополнительные поля для UI
     owner_username: Optional[str] = None
+    owner_full_name: Optional[str] = None
 
     class Config:
         from_attributes = True
+
+
+# --- Пользователи ---
+class UserRead(BaseModel):
+    id: int
+    full_name: str
+    username: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+# --- Жанры ---
+class GenreList(BaseModel):
+    genres: List[str]
 
 
 # --- История ---
@@ -83,7 +100,7 @@ class ReservationRequest(BaseModel):
 
 
 class ApproveRequest(BaseModel):
-    admin_id: int  # Кто подтверждает
+    admin_id: int
     due_date: datetime
 
 
@@ -92,6 +109,11 @@ class RejectRequest(BaseModel):
     reason: str = "Отклонено администратором"
 
 
-class ReturnRequest(BaseModel):
-    user_id: int  # Кто возвращает (может быть админ или заемщик)
-    is_admin: bool = False  # Флаг, если возвращает админ принудительно
+# --- Webhook Payload (Сервер -> Бот) ---
+class NotificationPayload(BaseModel):
+    """Формат данных, которые сервер отправляет боту по HTTP"""
+    user_id: int
+    type: NotificationType
+    message: str
+    book_id: Optional[int] = None
+    meta: dict = {}

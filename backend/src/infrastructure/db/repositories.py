@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional, List
 
-from sqlalchemy import select, update, delete, and_, desc
+from sqlalchemy import select, update, delete, and_, desc, distinct
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from infrastructure.db.models import UserTable, BookTable, BookHistoryTable, WaitlistTable
@@ -20,7 +20,6 @@ class UserRepository:
             self.session.add(user)
             await self.session.commit()
         else:
-            # Обновляем инфу, если сменилась
             if user.full_name != full_name or user.username != username:
                 user.full_name = full_name
                 user.username = username
@@ -29,6 +28,18 @@ class UserRepository:
 
     async def get_by_id(self, user_id: int):
         return await self.session.get(UserTable, user_id)
+
+    async def search_users(self, query_str: str = None) -> List[UserTable]:
+        stmt = select(UserTable)
+        if query_str:
+            # Ищем по username или full_name
+            stmt = stmt.where(
+                (UserTable.username.ilike(f"%{query_str}%")) |
+                (UserTable.full_name.ilike(f"%{query_str}%"))
+            )
+        stmt = stmt.limit(50)  # Ограничиваем выдачу для инлайн-режима
+        result = await self.session.execute(stmt)
+        return result.scalars().all()
 
 
 class BookRepository:
@@ -43,7 +54,7 @@ class BookRepository:
             description=book_data.description,
             genre=book_data.genre,
             isbn=book_data.isbn,
-            image_path=book_data.image_path or "default_cover.jpg",  # Default image handling
+            image_path=book_data.image_path,
             status=BookStatus.AVAILABLE
         )
         self.session.add(new_book)
@@ -52,7 +63,6 @@ class BookRepository:
         return new_book
 
     async def get_book_by_id(self, book_id: int) -> Optional[BookTable]:
-        # Подгружаем владельца для отображения username
         query = select(BookTable).options(selectinload(BookTable.owner)).where(BookTable.id == book_id)
         result = await self.session.execute(query)
         return result.scalars().one_or_none()
@@ -74,7 +84,6 @@ class BookRepository:
     async def update_status(self, book_id: int, status: BookStatus, borrower_id: int = None, due_date: datetime = None):
         values = {"status": status}
 
-        # Логика сброса/установки полей
         if status == BookStatus.AVAILABLE:
             values["borrower_id"] = None
             values["return_due_date"] = None
@@ -92,7 +101,6 @@ class BookRepository:
         query = select(BookTable).where(BookTable.is_deleted == False).options(selectinload(BookTable.owner))
 
         if title:
-            # Поиск и по автору и по названию (ТЗ 4.3)
             query = query.where(
                 (BookTable.title.ilike(f"%{title}%")) |
                 (BookTable.author.ilike(f"%{title}%"))
@@ -102,19 +110,30 @@ class BookRepository:
         if status:
             query = query.where(BookTable.status == status)
 
+        # Сортировка: сначала новые
+        query = query.order_by(desc(BookTable.created_at))
+
         result = await self.session.execute(query)
         return result.scalars().all()
 
     async def get_my_books(self, user_id: int) -> List[BookTable]:
-        """Мои книги (владелец) + Книги у меня (читатель)"""
         query = select(BookTable).where(
             and_(
                 BookTable.is_deleted == False,
                 (BookTable.owner_id == user_id) | (BookTable.borrower_id == user_id)
             )
-        ).options(selectinload(BookTable.owner))  # Подгружаем связь с владельцем
+        ).options(selectinload(BookTable.owner))
         result = await self.session.execute(query)
         return result.scalars().all()
+
+    async def get_all_genres(self) -> List[str]:
+        # Получаем уникальные жанры из БД + добавляем базовые, если БД пуста
+        query = select(distinct(BookTable.genre)).where(BookTable.genre != None)
+        result = await self.session.execute(query)
+        genres = [g for g in result.scalars().all() if g]
+        # Дефолтные жанры, если БД пустая или чтобы они всегда были в топе
+        defaults = ["Роман", "Фантастика", "Non-fiction", "Бизнес", "Психология"]
+        return list(set(genres + defaults))
 
     # --- History ---
     async def log_history(self, book_id: int, user_id: int, status_to: BookStatus, comment: str,
@@ -137,7 +156,6 @@ class BookRepository:
 
     # --- Waitlist ---
     async def add_to_waitlist(self, book_id: int, user_id: int):
-        # Check exists
         query = select(WaitlistTable).where(
             and_(WaitlistTable.book_id == book_id, WaitlistTable.user_id == user_id)
         )
