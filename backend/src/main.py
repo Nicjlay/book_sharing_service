@@ -1,136 +1,141 @@
-from datetime import datetime, timedelta
 from typing import List, Optional
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Query
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from starlette import status
 
-from infrastructure.services.image_service import image_service
-from domain.schemas import BookCreate, BookRead
 from infrastructure.db.session import get_db
 from infrastructure.db.repositories import UserRepository, BookRepository
-from domain.models import BookStatus
+from infrastructure.services.book_service import LibraryService
+from infrastructure.services.image_service import image_service
+from domain.schemas import (
+    BookCreate, BookRead, BookUpdate, ReservationRequest,
+    ApproveRequest, RejectRequest, BookHistoryRead
+)
+from domain.domain_models import BookStatus
 
-app = FastAPI(title="Book Sharing API")
+app = FastAPI(title="Library Bot API v2.0 (Refactored)")
 
 
-# --- СЕКЦИЯ: ПОЛЬЗОВАТЕЛИ ---
+# Helper to get service
+def get_service(db: AsyncSession = Depends(get_db)) -> LibraryService:
+    return LibraryService(db)
 
-@app.post("/users/auth", status_code=status.HTTP_200_OK)
+
+# --- USERS ---
+@app.post("/users/auth")
 async def auth_user(tg_id: int, full_name: str, username: str = None, db: AsyncSession = Depends(get_db)):
-    """Авторизация пользователя (Шаг 0)."""
     repo = UserRepository(db)
-    user = await repo.get_or_create_user(tg_id, full_name, username)
-    return {"status": "ok", "user_id": user.id}
+    return await repo.get_or_create_user(tg_id, full_name, username)
 
 
-# --- СЕКЦИЯ: КАТАЛОГ (ПУНКТ 3.2 ТЗ) ---
-
+# --- CATALOG ---
 @app.get("/books", response_model=List[BookRead])
-async def list_books(
-        title: Optional[str] = Query(None, description="Поиск по названию"),
-        genre: Optional[str] = Query(None, description="Фильтр по жанру"),
-        status: Optional[BookStatus] = Query(None, description="Фильтр по статусу"),
+async def search_books(
+        title: Optional[str] = None,
+        genre: Optional[str] = None,
+        status: Optional[BookStatus] = None,
         db: AsyncSession = Depends(get_db)
 ):
-    """Просмотр каталога с фильтрами (Команда /catalog)."""
     repo = BookRepository(db)
-    return await repo.search_books(title=title, genre=genre, status=status)
+    # ТЗ 3.1: Интерактивное меню с фильтрами, полнотекстовый поиск
+    return await repo.search_books(title, genre, status)
 
 
 @app.get("/books/my/{user_id}", response_model=List[BookRead])
-async def get_my_shelf(user_id: int, db: AsyncSession = Depends(get_db)):
-    """Личный кабинет: список книг, которыми я владею или которые у меня на руках."""
+async def get_my_books(user_id: int, db: AsyncSession = Depends(get_db)):
+    # ТЗ 3.3.1: "Мои книги"
     repo = BookRepository(db)
     return await repo.get_my_books(user_id)
 
 
-# --- СЕКЦИЯ: РАБОТА С КНИГАМИ (ПУНКТ 2 ТЗ) ---
-
-@app.post("/books", response_model=BookRead, status_code=status.HTTP_201_CREATED)
-async def create_book(book_in: BookCreate, db: AsyncSession = Depends(get_db)):
-    """Финальный этап добавления книги (Шаг 6 Wizard)."""
-    user_repo = UserRepository(db)
-    # Проверка: существует ли владелец
-    user = await user_repo.get_by_id(book_in.owner_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="Владелец не найден")
-
-    book_repo = BookRepository(db)
-    book_id = await book_repo.add_book(book_in)
-
-    # Автоматически логируем создание в историю
-    await book_repo.log_history(book_id, book_in.owner_id, BookStatus.AVAILABLE, "Книга добавлена в каталог")
-
-    return await book_repo.get_book_by_id(book_id)
-
-
-@app.post("/books/{book_id}/reserve")
-async def request_reservation(book_id: int, user_id: int, db: AsyncSession = Depends(get_db)):
-    """Запрос на бронирование от пользователя (Пункт 3.2 ТЗ)."""
+@app.get("/books/{book_id}", response_model=BookRead)
+async def get_book_detail(book_id: int, db: AsyncSession = Depends(get_db)):
     repo = BookRepository(db)
     book = await repo.get_book_by_id(book_id)
-
-    if not book:
-        raise HTTPException(status_code=404, detail="Книга не найдена")
-    if book.status != BookStatus.AVAILABLE:
-        raise HTTPException(status_code=400, detail="Книга недоступна для бронирования")
-
-    # Переводим в статус "Забронирована" (Желтый по ТЗ)
-    await repo.update_book_status(book_id, BookStatus.RESERVED, borrower_id=user_id)
-    await repo.log_history(book_id, user_id, BookStatus.RESERVED, "Запрос на бронирование отправлен админу")
-
-    return {"message": "Запрос отправлен администратору"}
+    if not book or book.is_deleted:
+        raise HTTPException(status_code=404, detail="Book not found")
+    return book
 
 
-# --- СЕКЦИЯ: АДМИНКА (ПУНКТ 3.3 и 4.2 ТЗ) ---
+@app.get("/books/{book_id}/history", response_model=List[BookHistoryRead])
+async def get_book_history(book_id: int, db: AsyncSession = Depends(get_db)):
+    # ТЗ 4.4: Журнал истории
+    repo = BookRepository(db)
+    return await repo.get_history(book_id)
 
-@app.post("/admin/books/{book_id}/approve")
-async def approve_issue(
+
+# --- WIZARD & MANAGEMENT ---
+@app.post("/books", response_model=BookRead, status_code=201)
+async def create_book_endpoint(book_in: BookCreate, service: LibraryService = Depends(get_service)):
+    # ТЗ 1: Итог визарда
+    book_id = await service.create_book(book_in)
+    repo = BookRepository(service.db)
+    return await repo.get_book_by_id(book_id)
+
+
+@app.patch("/books/{book_id}", response_model=BookRead)
+async def edit_book_endpoint(book_id: int, update: BookUpdate, user_id: int = Query(...),
+                             service: LibraryService = Depends(get_service)):
+    # ТЗ 4.1: Редактирование
+    return await service.edit_book(book_id, user_id, update)
+
+
+@app.delete("/books/{book_id}")
+async def delete_book_endpoint(book_id: int, user_id: int = Query(...), service: LibraryService = Depends(get_service)):
+    await service.delete_book(book_id, user_id)
+    return {"status": "deleted"}
+
+
+@app.post("/media/upload")
+async def upload_media(file: UploadFile = File(...)):
+    # ТЗ 1 (Шаг 3): Загрузка фото
+    path = await image_service.process_and_save(file)
+    return {"path": path}
+
+
+# --- FLOW: RESERVATION & RETURN ---
+
+@app.post("/borrowings/request")
+async def request_reservation(payload: ReservationRequest, book_id: int = Query(...),
+                              service: LibraryService = Depends(get_service)):
+    # ТЗ 3.2.2: Запрос на бронь
+    return await service.request_reservation(book_id, payload.user_id, payload.days)
+
+
+@app.post("/borrowings/approve")
+async def approve_reservation(payload: ApproveRequest, book_id: int = Query(...),
+                              service: LibraryService = Depends(get_service)):
+    # ТЗ 3.2.3: Админ подтверждает
+    return await service.approve_reservation(book_id, payload.admin_id, payload.due_date)
+
+
+@app.post("/borrowings/reject")
+async def reject_reservation(payload: RejectRequest, book_id: int = Query(...),
+                             service: LibraryService = Depends(get_service)):
+    # ТЗ 3.2.3: Админ отклоняет
+    await service.reject_reservation(book_id, payload.admin_id, payload.reason)
+    return {"status": "rejected"}
+
+
+@app.post("/borrowings/return")
+async def return_book_endpoint(
         book_id: int,
-        admin_id: int,
-        days: int = 14,
-        db: AsyncSession = Depends(get_db)
+        user_id: int = Query(...),
+        is_admin: bool = Query(False),
+        photo: Optional[UploadFile] = File(None),
+        service: LibraryService = Depends(get_service)
 ):
-    """Админ подтверждает выдачу (Кнопка ✅ Выдал книгу)."""
+    # ТЗ 3.3: Возврат
+    return await service.return_book(book_id, user_id, is_admin, photo)
+
+
+@app.post("/books/{book_id}/waitlist")
+async def join_waitlist(book_id: int, user_id: int, db: AsyncSession = Depends(get_db)):
+    # ТЗ 3.2: Кнопка "Уведомить меня"
     repo = BookRepository(db)
     book = await repo.get_book_by_id(book_id)
+    if not book or book.status == BookStatus.AVAILABLE:
+        raise HTTPException(status_code=400, detail="Книга доступна, можно брать")
 
-    if not book or book.status != BookStatus.RESERVED:
-        raise HTTPException(status_code=400, detail="Нет активной заявки на эту книгу")
-
-    due_date = datetime.now() + timedelta(days=days)
-    await repo.issue_book(book_id, due_date)  # Метод в репозитории
-    await repo.log_history(book_id, admin_id, BookStatus.BORROWED, f"Выдача подтверждена до {due_date.date()}")
-
-    return {"status": "issued", "due_date": due_date}
-
-
-@app.post("/books/{book_id}/return")
-async def return_book(book_id: int, user_id: int, db: AsyncSession = Depends(get_db)):
-    """Возврат книги (Пункт 3.3 ТЗ)."""
-    repo = BookRepository(db)
-    book = await repo.get_book_by_id(book_id)
-
-    if not book or book.borrower_id != user_id:
-        raise HTTPException(status_code=400, detail="Вы не можете вернуть книгу, которую не брали")
-
-    await repo.update_book_status(book_id, BookStatus.AVAILABLE, borrower_id=None)
-    await repo.log_history(book_id, user_id, BookStatus.AVAILABLE, "Книга возвращена владельцу")
-
-    return {"status": "returned"}
-
-
-# --- СЕКЦИЯ: МЕДИА (ПУНКТ 2 ШАГ 3 ТЗ) ---
-
-@app.post("/books/{book_id}/image")
-async def upload_cover(book_id: int, file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
-    """Загрузка обложки."""
-    if file.content_type not in ["image/jpeg", "image/png", "image/webp"]:
-        raise HTTPException(status_code=400, detail="Неверный формат изображения")
-
-    file_path = await image_service.process_and_save(file)
-
-    repo = BookRepository(db)
-    await repo.update_book_image(book_id, file_path)
-    return {"path": file_path}
+    await repo.add_to_waitlist(book_id, user_id)
+    return {"message": "Вы добавлены в лист ожидания"}
