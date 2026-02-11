@@ -70,6 +70,7 @@ class UserRead(BaseModel):
     id: int
     full_name: str
     username: Optional[str] = None
+    is_admin: bool
 
     class Config:
         from_attributes = True

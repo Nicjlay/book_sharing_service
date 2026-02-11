@@ -1,6 +1,6 @@
 from typing import List, Optional
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Query, status
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 import asyncio
 
@@ -31,9 +31,15 @@ def get_service(db: AsyncSession = Depends(get_db)) -> LibraryService:
 
 # --- USERS ---
 @app.post("/users/auth", response_model=UserRead)
-async def auth_user(tg_id: int, full_name: str, username: str = None, db: AsyncSession = Depends(get_db)):
+async def auth_user(
+    tg_id: int,
+    full_name: str,
+    username: str = None,
+    is_admin: bool = False, # Бот передает это, сверив с ENV
+    db: AsyncSession = Depends(get_db)
+):
     repo = UserRepository(db)
-    return await repo.get_or_create_user(tg_id, full_name, username)
+    return await repo.get_or_create_user(tg_id, full_name, username, is_admin)
 
 
 @app.get("/users", response_model=List[UserRead])
@@ -91,6 +97,17 @@ async def get_my_books(user_id: int, db: AsyncSession = Depends(get_db)):
         results.append(dto)
     return results
 
+@app.get("/books", response_model=List[BookRead])
+async def list_books(
+    status: Optional[BookStatus] = None,  # Для админа: ?status=reserved
+    genre: Optional[str] = None,
+    query: Optional[str] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    repo = BookRepository(db)
+    if query:
+        return await repo.search_books(query)
+    return await repo.get_books(status=status, genre=genre)
 
 @app.get("/books/{book_id}", response_model=BookRead)
 async def get_book_detail(book_id: int, db: AsyncSession = Depends(get_db)):

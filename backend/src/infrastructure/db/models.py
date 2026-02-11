@@ -12,6 +12,7 @@ class UserTable(Base):
     id = Column(Integer, primary_key=True, index=True)  # Telegram ID
     full_name = Column(String, nullable=False)
     username = Column(String, nullable=True)
+    is_admin = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 

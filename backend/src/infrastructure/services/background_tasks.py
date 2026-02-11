@@ -34,6 +34,20 @@ class NotificationService:
                 print(f"❌ Failed to push notification to bot: {e}")
                 # TODO: Здесь можно добавить механизм Retry (очередь повторных попыток)
 
+    async def notify_new_book(self, book: Any, owner_username: str):
+        """Уведомление в группу о новой книге (ТЗ 3.1.3)"""
+        payload = {
+            "type": NotificationType.NEW_BOOK,
+            "user_id": 0,  # 0 или спец. ID для системных сообщений в группу
+            "data": {
+                "title": book.title,
+                "author": book.author,
+                "owner_username": owner_username,
+                "book_id": book.id
+            }
+        }
+        await self._send_http_notification(payload)
+
     async def notify_owner_about_return(self, book: BookTable, returner_id: int, photo_path: str = None):
         msg = f"📚 Ваша книга '{book.title}' возвращена (ID {returner_id})."
         if photo_path:

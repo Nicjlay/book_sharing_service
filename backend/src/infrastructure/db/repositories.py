@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional, List
 
-from sqlalchemy import select, update, delete, and_, desc, distinct
+from sqlalchemy import select, update, delete, and_, desc, distinct, or_
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from infrastructure.db.models import UserTable, BookTable, BookHistoryTable, WaitlistTable
@@ -13,17 +13,18 @@ class UserRepository:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    async def get_or_create_user(self, tg_id: int, full_name: str, username: str = None):
+    async def get_or_create_user(self, tg_id: int, full_name: str, username: str = None, is_admin: bool = False):
         user = await self.session.get(UserTable, tg_id)
         if not user:
-            user = UserTable(id=tg_id, full_name=full_name, username=username)
+            user = UserTable(id=tg_id, full_name=full_name, username=username, is_admin=is_admin)
             self.session.add(user)
-            await self.session.commit()
         else:
-            if user.full_name != full_name or user.username != username:
-                user.full_name = full_name
-                user.username = username
-                await self.session.commit()
+            # Обновляем данные, если они изменились (включая статус админа из конфига бота)
+            user.full_name = full_name
+            user.username = username
+            user.is_admin = is_admin
+
+        await self.session.commit()
         return user
 
     async def get_by_id(self, user_id: int):
@@ -97,23 +98,30 @@ class BookRepository:
         await self.session.execute(stmt)
         await self.session.commit()
 
-    async def search_books(self, title: str = None, genre: str = None, status: BookStatus = None) -> List[BookTable]:
-        query = select(BookTable).where(BookTable.is_deleted == False).options(selectinload(BookTable.owner))
-
-        if title:
-            query = query.where(
-                (BookTable.title.ilike(f"%{title}%")) |
-                (BookTable.author.ilike(f"%{title}%"))
-            )
-        if genre:
-            query = query.where(BookTable.genre == genre)
+    async def get_books(self, status: Optional[BookStatus] = None, genre: Optional[str] = None):
+        """Метод для получения книг с фильтрацией (в т.ч. для админской очереди)"""
+        query = select(BookTable).where(BookTable.is_deleted == False)
         if status:
             query = query.where(BookTable.status == status)
-
-        # Сортировка: сначала новые
-        query = query.order_by(desc(BookTable.created_at))
+        if genre:
+            query = query.where(BookTable.genre == genre)
 
         result = await self.session.execute(query)
+        return result.scalars().all()
+
+    async def search_books(self, query_str: str):
+        """Полнотекстовый поиск по названию и автору (ТЗ 4.3)"""
+        from sqlalchemy import or_
+        stmt = select(BookTable).where(
+            and_(
+                BookTable.is_deleted == False,
+                or_(
+                    BookTable.title.ilike(f"%{query_str}%"),
+                    BookTable.author.ilike(f"%{query_str}%")
+                )
+            )
+        )
+        result = await self.session.execute(stmt)
         return result.scalars().all()
 
     async def get_my_books(self, user_id: int) -> List[BookTable]:
