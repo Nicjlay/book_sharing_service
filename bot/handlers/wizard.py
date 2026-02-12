@@ -14,37 +14,29 @@ from keyboards.inline import (
     genres_keyboard,
     users_selection_keyboard,
     wizard_confirm_keyboard,
-    cancel_keyboard
+    cancel_keyboard, main_menu_keyboard
 )
 from utils.validators import validate_author, validate_title, validate_description, is_image
 from utils.formatters import format_wizard_preview
 from config import settings
+
+from .admin import admin_only
 
 router = Router()
 
 
 @router.message(Command("add"))
 @router.callback_query(F.data == "add_book")
-async def start_add_book_wizard(event: Message | CallbackQuery, state: FSMContext):
+@admin_only  # Используем декоратор для защиты входа в визард
+async def start_add_book_wizard(event: Message | CallbackQuery, state: FSMContext, **kwargs):
     """
     Начало визарда добавления книги
     Шаг 1: Запрос автора (ТЗ 3.1.1)
     """
-    user_id = event.from_user.id if isinstance(event, Message) else event.message.from_user.id
-    
-    # Проверка прав (только админы могут добавлять книги)
-    if user_id not in settings.admin_ids_list:
-        text = "❌ Добавлять книги могут только администраторы."
-        if isinstance(event, CallbackQuery):
-            await event.answer(text, show_alert=True)
-        else:
-            await event.answer(text)
-        return
-    
     # Начинаем визард
     await state.set_state(AddBookWizard.author)
     await state.update_data(wizard_data={})
-    
+
     text = (
         "📖 <b>Добавление новой книги</b>\n\n"
         "📝 <b>Шаг 1/6:</b> Автор книги\n\n"
@@ -52,7 +44,7 @@ async def start_add_book_wizard(event: Message | CallbackQuery, state: FSMContex
         "(например: <i>Достоевский Федор</i>)\n\n"
         "⚠️ Необходимо указать минимум два слова"
     )
-    
+
     if isinstance(event, CallbackQuery):
         await event.message.edit_text(
             text,
@@ -70,27 +62,20 @@ async def start_add_book_wizard(event: Message | CallbackQuery, state: FSMContex
 
 @router.message(AddBookWizard.author)
 async def process_author(message: Message, state: FSMContext):
-    """
-    Обработка ввода автора с валидацией (ТЗ 3.1.1)
-    """
+    """Обработка ввода автора с валидацией"""
     author = message.text.strip()
-    
-    # Валидация: минимум два слова
     is_valid, error_msg = validate_author(author)
-    
+
     if not is_valid:
         await message.answer(error_msg, parse_mode="HTML")
         return
-    
-    # Сохраняем автора и переходим к следующему шагу
+
     data = await state.get_data()
     wizard_data = data.get("wizard_data", {})
     wizard_data["author"] = author
     await state.update_data(wizard_data=wizard_data)
-    
-    # Шаг 2: Название книги
+
     await state.set_state(AddBookWizard.title)
-    
     await message.answer(
         f"✅ Автор: <b>{author}</b>\n\n"
         f"📝 <b>Шаг 2/6:</b> Название книги\n\n"
@@ -595,16 +580,12 @@ async def edit_wizard_data(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "wizard_cancel")
 async def cancel_wizard(callback: CallbackQuery, state: FSMContext):
-    """
-    Отмена визарда
-    """
+    """Отмена визарда"""
     await state.clear()
-    
-    user_id = callback.from_user.id
+
+    user_id = callback.from_user.id  # Исправлено здесь тоже
     is_admin = user_id in settings.admin_ids_list
-    
-    from keyboards.inline import main_menu_keyboard
-    
+
     await callback.message.edit_text(
         "❌ Добавление книги отменено\n\n📋 Главное меню",
         reply_markup=main_menu_keyboard(is_admin),
