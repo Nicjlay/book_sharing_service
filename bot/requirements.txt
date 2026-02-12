@@ -1,0 +1,19 @@
+# Telegram Bot Framework
+aiogram==3.4.1
+
+# HTTP Client для API
+aiohttp==3.9.1
+
+# Environment Variables
+python-dotenv==1.0.0
+
+# FastAPI для webhook endpoint
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+
+# Date/Time
+python-dateutil==2.8.2
+
+# Validation
+pydantic==2.5.3
+pydantic-settings==2.1.0

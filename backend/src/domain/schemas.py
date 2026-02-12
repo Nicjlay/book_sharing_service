@@ -77,6 +77,11 @@ class UserRead(BaseModel):
     class Config:
         from_attributes = True
 
+class UserAuthRequest(BaseModel):
+    tg_id: int
+    full_name: str
+    username: Optional[str] = None
+    is_admin: bool = False
 
 # --- Жанры ---
 class GenreList(BaseModel):

@@ -1,0 +1,74 @@
+version: '3.8'
+
+services:
+  api:
+    # --- СТРАЯ ЛОГИКА (Сборка и код) ---
+    build:
+      dockerfile: Dockerfile
+    # Добавил имя контейнера для удобства (из нового)
+    container_name: library_api
+    ports:
+      - "8000:8000"
+    volumes:
+      # Оставляем проброс кода для разработки (старая логика)
+      - ./src:/app
+      # Общий volume для медиа
+      - ./media:/app/media
+
+    # --- СЛИЯНИЕ ENV (Настройки БД старые + Настройки приложения новые) ---
+    environment:
+      - MODE=DEV
+      # Настройки подключения к Postgres (чтобы приложение знало, куда стучаться)
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=pass
+      - POSTGRES_DB=library_db
+      - POSTGRES_HOST=db  # Важно: хост теперь имя сервиса 'db'
+      - POSTGRES_PORT=5432
+
+      # Новые переменные из первого файла (Токены, Админы и т.д.)
+      - API_TOKEN=${API_TOKEN}
+      - BOT_WEBHOOK_URL=${BOT_WEBHOOK_URL}
+      - ADMIN_USER_IDS=${ADMIN_USER_IDS}
+      - MEDIA_UPLOAD_DIR=media/books
+      - APP_HOST=0.0.0.0
+      - APP_PORT=8000
+
+    # --- НОВАЯ ЛОГИКА (Сеть и здоровье) ---
+    networks:
+      - library_network
+
+    # Healthcheck из нового файла (полезно для оркестрации)
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+    # Гарантируем, что API запустится после БД
+    depends_on:
+      - db
+    restart: unless-stopped
+
+  db:
+    # --- СТРАЯ ЛОГИКА (Postgres) ---
+    image: postgres:15-alpine
+    container_name: library_db # Опционально, для удобства
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=pass
+      - POSTGRES_DB=library_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # Подключаем БД к той же новой сети, чтобы API её видел
+    networks:
+      - library_network
+
+# --- НОВАЯ ЛОГИКА (Объявление сети) ---
+networks:
+  library_network:
+    name: library_network
+    driver: bridge
+
+# --- СТАРАЯ ЛОГИКА (Хранилище БД) ---
+volumes:
+  postgres_data:
