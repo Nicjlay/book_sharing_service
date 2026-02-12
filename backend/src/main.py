@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Query, Header, Form
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Query, Header, Form, Body
 from sqlalchemy.ext.asyncio import AsyncSession
 import asyncio
 import os
@@ -21,11 +21,10 @@ from domain.domain_models import BookStatus
 
 dotenv_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path)
-
-app = FastAPI(title="Library Bot API v2.1 (Push Architecture)")
-
 # Токен для защиты webhook эндпоинтов
 API_TOKEN = os.getenv("API_TOKEN")
+
+app = FastAPI(title="Library Bot API v2.1 (Push Architecture)")
 
 
 # Middleware для проверки токена на webhook эндпоинтах
@@ -49,20 +48,19 @@ def get_service(db: AsyncSession = Depends(get_db)) -> LibraryService:
 # --- USERS ---
 @app.post("/users/auth", response_model=UserRead)
 async def auth_user(
-        user_data: UserAuthRequest,
-        db: AsyncSession = Depends(get_db)
+    user_data: UserAuthRequest,
+    db: AsyncSession = Depends(get_db)
 ):
-    """
-    Принимаем UserAuthRequest (без обязательного id),
-    но возвращаем полный UserRead (с id из базы).
-    """
     repo = UserRepository(db)
-    return await repo.get_or_create_user(
-        user_data.tg_id,
-        user_data.full_name,
-        user_data.username,
-        user_data.is_admin
+
+    user = await repo.get_or_create_user(
+        tg_id=user_data.tg_id,
+        full_name=user_data.full_name,
+        username=user_data.username,
+        is_admin=user_data.is_admin
     )
+
+    return user
 
 
 @app.get("/users", response_model=List[UserRead])

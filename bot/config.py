@@ -10,22 +10,22 @@ class Settings(BaseSettings):
     """Настройки бота из переменных окружения"""
     
     # Telegram Bot
-    bot_token: str
+    bot_token: str = os.getenv("BOT_TOKEN")
     
     # API Backend
-    api_url: str = "http://localhost:8000"
-    api_token: str
+    api_url: str = os.getenv("API_URL")
+    api_token: str = os.getenv("API_TOKEN")
     
     # Admin Users (Telegram IDs)
-    admin_user_ids: str = "964229335"
+    admin_user_ids: str = os.getenv("ADMIN_USER_IDS")
     
     # Webhook для приема уведомлений от API
-    webhook_host: str = "0.0.0.0"
-    webhook_port: int = 8001
-    webhook_path: str = "/webhook"
+    webhook_host: str = os.getenv("WEBHOOK_HOST")
+    webhook_port: int = os.getenv("WEBHOOK_PORT")
+    webhook_path: str = os.getenv("WEBHOOK_PATH")
     
     # Group Chat ID для уведомлений о новых книгах
-    group_chat_id: str = ""  # Опционально
+    group_chat_id: str = os.getenv("GROUP_CHAT_ID")
     
     @property
     def admin_ids_list(self) -> List[int]:
