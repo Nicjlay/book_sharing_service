@@ -7,6 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import asyncio
 import os
 
+from starlette.staticfiles import StaticFiles
+
 from infrastructure.db.session import get_db
 from infrastructure.db.repositories import UserRepository, BookRepository
 from infrastructure.services.book_service import LibraryService
@@ -26,6 +28,26 @@ API_TOKEN = os.getenv("API_TOKEN")
 
 app = FastAPI(title="Library Bot API v2.1 (Push Architecture)")
 
+# 1. Определяем базовую папку медиа.
+# В Docker контейнере это обычно /app/media
+MEDIA_ROOT = Path(os.getenv("MEDIA_UPLOAD_DIR", "/app/media"))
+BOOKS_MEDIA_DIR = MEDIA_ROOT / "books"
+
+# 2. Создаем папки при старте, если их нет
+BOOKS_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+
+# 3. Путь к заглушке (физический)
+DEFAULT_IMAGE_PATH = BOOKS_MEDIA_DIR / "base_cover.jpg"
+
+# Простая проверка: если заглушки нет, можно положить туда пустой файл
+# или вывести предупреждение в логи при старте
+if not DEFAULT_IMAGE_PATH.exists():
+    print(f"⚠️ WARNING: Placeholder image not found at {DEFAULT_IMAGE_PATH}")
+
+# 4. Монтируем статику
+# Теперь любой файл в /app/media/books/image.jpg
+# будет доступен по URL: your-api.com/media/books/image.jpg
+app.mount("/media", StaticFiles(directory=MEDIA_ROOT), name="media")
 
 # Middleware для проверки токена на webhook эндпоинтах
 async def verify_bot_token(x_api_token: str = Header(None)):
@@ -126,15 +148,23 @@ async def get_book_history(book_id: int, db: AsyncSession = Depends(get_db)):
 
 # --- WIZARD & MANAGEMENT ---
 @app.post("/books", response_model=BookRead, status_code=201)
-async def create_book_endpoint(book_in: BookCreate, service: LibraryService = Depends(get_service)):
-    book_id = await service.create_book(book_in)
+async def create_book_endpoint(
+        title: str = Form(...),
+        author: str = Form(...),
+        description: str = Form(None),
+        genre: str = Form(...),
+        owner_id: int = Form(...),
+        photo: Optional[UploadFile] = File(None),  # Явно указываем Optional и File
+        service: LibraryService = Depends(get_service)
+):
+    book_in = BookCreate(
+        title=title, author=author, description=description,
+        genre=genre, owner_id=owner_id
+    )
+    book_id = await service.create_book(book_in, photo)
     repo = BookRepository(service.db)
     book = await repo.get_book_by_id(book_id)
-
-    dto = BookRead.model_validate(book)
-    if book.owner:
-        dto.owner_username = book.owner.username
-    return dto
+    return BookRead.model_validate(book)
 
 
 @app.patch("/books/{book_id}", response_model=BookRead)

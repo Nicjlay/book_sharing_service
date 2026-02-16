@@ -12,7 +12,8 @@ from keyboards.inline import (
     genres_keyboard,
     book_card_keyboard,
     main_menu_keyboard,
-    pagination_keyboard
+    pagination_keyboard,
+    cancel_keyboard
 )
 from utils.formatters import format_book_card, format_book_list
 from config import settings
@@ -240,11 +241,11 @@ async def show_book_detail(callback: CallbackQuery):
         if book.get("image_path"):
             try:
                 # Формируем URL изображения
-                image_url = f"{settings.api_url}/{book['image_path']}"
+                photo_bytes = await api.get_image_bytes(book['image_path'])
                 
                 await callback.message.delete()
                 await callback.message.answer_photo(
-                    photo=image_url,
+                    photo=photo_bytes,
                     caption=text,
                     reply_markup=book_card_keyboard(book, user_id, is_admin),
                     parse_mode="HTML"
@@ -283,9 +284,7 @@ async def start_search(event: Message | CallbackQuery, state: FSMContext):
         "Введите название книги или имя автора для поиска:\n\n"
         "Например: <i>Достоевский</i> или <i>Идиот</i>"
     )
-    
-    from keyboards.inline import cancel_keyboard
-    
+
     if isinstance(event, CallbackQuery):
         await event.message.edit_text(
             text,

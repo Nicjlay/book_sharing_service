@@ -2,10 +2,13 @@
 Handler для визарда добавления книги (ТЗ 3.1)
 Пошаговый диалог из 6 шагов
 """
+import io
 from aiogram import Router, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, BufferedInputFile
 from aiogram.fsm.context import FSMContext
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import InlineKeyboardButton
 
 from api.client import api
 from states.wizard import AddBookWizard
@@ -14,9 +17,10 @@ from keyboards.inline import (
     genres_keyboard,
     users_selection_keyboard,
     wizard_confirm_keyboard,
-    cancel_keyboard, main_menu_keyboard
+    cancel_keyboard,
+    main_menu_keyboard
 )
-from utils.validators import validate_author, validate_title, validate_description, is_image
+from utils.validators import validate_author, validate_title, validate_description
 from utils.formatters import format_wizard_preview
 from config import settings
 
@@ -24,16 +28,18 @@ from .admin import admin_only
 
 router = Router()
 
+# ==========================================
+# 1. ЗАПУСК ВИЗАРДА
+# ==========================================
 
 @router.message(Command("add"))
 @router.callback_query(F.data == "add_book")
-@admin_only  # Используем декоратор для защиты входа в визард
+@admin_only
 async def start_add_book_wizard(event: Message | CallbackQuery, state: FSMContext, **kwargs):
     """
     Начало визарда добавления книги
-    Шаг 1: Запрос автора (ТЗ 3.1.1)
+    Шаг 1: Запрос автора
     """
-    # Начинаем визард
     await state.set_state(AddBookWizard.author)
     await state.update_data(wizard_data={})
 
@@ -46,26 +52,20 @@ async def start_add_book_wizard(event: Message | CallbackQuery, state: FSMContex
     )
 
     if isinstance(event, CallbackQuery):
-        await event.message.edit_text(
-            text,
-            reply_markup=cancel_keyboard(),
-            parse_mode="HTML"
-        )
+        await event.message.edit_text(text, reply_markup=cancel_keyboard(), parse_mode="HTML")
         await event.answer()
     else:
-        await event.answer(
-            text,
-            reply_markup=cancel_keyboard(),
-            parse_mode="HTML"
-        )
+        await event.answer(text, reply_markup=cancel_keyboard(), parse_mode="HTML")
 
+
+# ==========================================
+# 2. АВТОР
+# ==========================================
 
 @router.message(AddBookWizard.author)
 async def process_author(message: Message, state: FSMContext):
-    """Обработка ввода автора с валидацией"""
     author = message.text.strip()
     is_valid, error_msg = validate_author(author)
-
     if not is_valid:
         await message.answer(error_msg, parse_mode="HTML")
         return
@@ -85,29 +85,24 @@ async def process_author(message: Message, state: FSMContext):
     )
 
 
+# ==========================================
+# 3. НАЗВАНИЕ
+# ==========================================
+
 @router.message(AddBookWizard.title)
 async def process_title(message: Message, state: FSMContext):
-    """
-    Обработка ввода названия книги (ТЗ 3.1.2)
-    """
     title = message.text.strip()
-    
-    # Валидация
     is_valid, error_msg = validate_title(title)
-    
     if not is_valid:
         await message.answer(error_msg, parse_mode="HTML")
         return
-    
-    # Сохраняем название
+
     data = await state.get_data()
     wizard_data = data.get("wizard_data", {})
     wizard_data["title"] = title
     await state.update_data(wizard_data=wizard_data)
-    
-    # Шаг 3: Фото обложки (опционально)
+
     await state.set_state(AddBookWizard.photo)
-    
     await message.answer(
         f"✅ Название: <b>{title}</b>\n\n"
         f"📝 <b>Шаг 3/6:</b> Фото обложки\n\n"
@@ -119,25 +114,23 @@ async def process_title(message: Message, state: FSMContext):
     )
 
 
+# ==========================================
+# 4. ФОТО (ИСПРАВЛЕНО)
+# ==========================================
+
 @router.callback_query(F.data == "skip_photo", AddBookWizard.photo)
 async def skip_photo(callback: CallbackQuery, state: FSMContext):
-    """
-    Пропуск загрузки фото (ТЗ 3.1.3)
-    """
-    # Переходим к следующему шагу без фото
-    await process_photo_step_complete(callback.message, state, photo_path=None)
     await callback.answer("Фото пропущено")
-
+    await process_photo_step_complete(callback.message, state)
 
 @router.message(AddBookWizard.photo, F.photo)
 async def process_photo(message: Message, state: FSMContext):
     """
-    Обработка загруженного фото (ТЗ 3.1.3)
+    Обработка загруженного фото.
+    Здесь была основная ошибка с пустым файлом.
     """
-    # Получаем самое большое фото
-    photo = message.photo[-1]
-    
-    # Проверка размера (до 5 МБ)
+    photo = message.photo[-1] # Берем самое качественное фото
+
     if photo.file_size > 5 * 1024 * 1024:
         await message.answer(
             "❌ Файл слишком большой (максимум 5 МБ)\n"
@@ -145,360 +138,255 @@ async def process_photo(message: Message, state: FSMContext):
             parse_mode="HTML"
         )
         return
-    
+
     try:
-        # Скачиваем фото
-        file = await message.bot.download(photo.file_id)
-        file_data = file.read()
-        
-        # Загружаем на сервер через API
-        image_path = await api.upload_media(file_data, f"book_{photo.file_id}.jpg")
-        
-        # Сохраняем путь к фото
+        # 1. Скачиваем фото в объект BytesIO (в память)
+        # Если destination не указан, aiogram создает BytesIO
+        file_io = await message.bot.download(photo.file_id)
+
+        # 2. ИСПРАВЛЕНИЕ ОШИБКИ:
+        # После скачивания курсор находится в конце файла.
+        # .read() вернет пустоту. Нужно использовать .getvalue() или .seek(0).
+        if isinstance(file_io, io.BytesIO):
+            photo_bytes = file_io.getvalue()
+        else:
+            # На случай изменений в aiogram, если вернется не BytesIO
+            file_io.seek(0)
+            photo_bytes = file_io.read()
+
+        if not photo_bytes:
+            raise ValueError("Получен пустой файл")
+
+        # 3. Сохраняем БАЙТЫ в состояние визарда
         data = await state.get_data()
         wizard_data = data.get("wizard_data", {})
-        wizard_data["image_path"] = image_path
+        wizard_data["photo_bytes"] = photo_bytes
+        # Ставим флаг, что фото есть (путь будет создан на сервере)
+        wizard_data["has_photo"] = True
+
         await state.update_data(wizard_data=wizard_data)
-        
-        await message.answer("✅ Фото обложки загружено!")
-        await process_photo_step_complete(message, state, photo_path=image_path)
-        
+
+        await message.answer("✅ Фото обложки сохранено в черновик!")
+        await process_photo_step_complete(message, state)
+
     except Exception as e:
+        print(f"Error processing photo: {e}")
         await message.answer(
-            "❌ Ошибка загрузки фото. Попробуйте еще раз или пропустите этот шаг.",
+            "❌ Не удалось обработать фото. Попробуйте еще раз или пропустите этот шаг.",
             parse_mode="HTML"
         )
-        print(f"Error uploading photo: {e}")
-
-
-@router.message(AddBookWizard.photo, F.document)
-async def process_document_as_photo(message: Message, state: FSMContext):
-    """
-    Обработка документа как фото (если пользователь отправил изображение как документ)
-    """
-    document = message.document
-    
-    # Проверяем, что это изображение
-    if not is_image(document.file_name):
-        await message.answer(
-            "❌ Пожалуйста, отправьте изображение (JPG, PNG, WEBP)",
-            parse_mode="HTML"
-        )
-        return
-    
-    # Проверка размера
-    if document.file_size > 5 * 1024 * 1024:
-        await message.answer(
-            "❌ Файл слишком большой (максимум 5 МБ)",
-            parse_mode="HTML"
-        )
-        return
-    
-    try:
-        # Скачиваем и загружаем
-        file = await message.bot.download(document.file_id)
-        file_data = file.read()
-        
-        image_path = await api.upload_media(file_data, document.file_name)
-        
-        data = await state.get_data()
-        wizard_data = data.get("wizard_data", {})
-        wizard_data["image_path"] = image_path
-        await state.update_data(wizard_data=wizard_data)
-        
-        await message.answer("✅ Фото обложки загружено!")
-        await process_photo_step_complete(message, state, photo_path=image_path)
-        
-    except Exception as e:
-        await message.answer("❌ Ошибка загрузки фото")
-        print(f"Error uploading document: {e}")
-
 
 @router.message(AddBookWizard.photo)
-async def invalid_photo_format(message: Message):
-    """
-    Обработка неправильного формата на шаге фото
-    """
-    await message.answer(
-        "❌ Пожалуйста, отправьте <b>изображение</b> или нажмите кнопку «Пропустить»",
-        reply_markup=wizard_skip_photo_keyboard(),
-        parse_mode="HTML"
-    )
+async def process_document_as_photo(message: Message):
+    await message.answer("⚠️ Пожалуйста, отправьте изображение как <b>Фото</b> (со сжатием), а не как Файл.", parse_mode="HTML")
 
 
-async def process_photo_step_complete(message: Message, state: FSMContext, photo_path: str = None):
-    """
-    Завершение шага с фото, переход к Шагу 4: Описание и жанр
-    """
-    # Шаг 4: Описание и жанр (ТЗ 3.1.4)
+async def process_photo_step_complete(message: Message, state: FSMContext):
+    """Переход к выбору жанра/описания"""
     await state.set_state(AddBookWizard.description)
-    
-    # Получаем список жанров для кнопок
+
     try:
-        genres = await api.get_genres()
-        
-        # Создаем клавиатуру с жанрами
-        from aiogram.utils.keyboard import InlineKeyboardBuilder
-        from aiogram.types import InlineKeyboardButton
-        
+        # Получаем жанры из API
+        genres_resp = await api.get_genres()
+        # Если API возвращает словарь {"genres": [...]}, берем список, иначе считаем списком
+        if isinstance(genres_resp, dict):
+            genres = genres_resp.get("genres", [])
+        else:
+            genres = genres_resp
+
         builder = InlineKeyboardBuilder()
-        
-        # Кнопки частых жанров (ТЗ 3.1.4)
+
+        # Популярные жанры для быстрого выбора
         common_genres = ["Роман", "Фантастика", "Non-fiction", "Бизнес", "Психология"]
-        for genre in common_genres:
-            if genre in genres:
-                builder.row(
-                    InlineKeyboardButton(text=f"📚 {genre}", callback_data=f"select_genre:{genre}")
-                )
-        
-        # Кнопка "Другое" для ввода своего жанра
-        builder.row(
-            InlineKeyboardButton(text="✏️ Ввести свой жанр", callback_data="select_genre:custom")
-        )
-        
-        # Кнопка пропуска
-        builder.row(
-            InlineKeyboardButton(text="⏭ Пропустить описание и жанр", callback_data="skip_description")
-        )
-        
-        builder.row(
-            InlineKeyboardButton(text="❌ Отмена", callback_data="wizard_cancel")
-        )
-        
+
+        # Фильтруем, чтобы показать только те, что есть в системе, или дефолтные
+        display_genres = [g for g in common_genres if g in genres] if genres else common_genres
+
+        for genre in display_genres:
+            builder.row(InlineKeyboardButton(text=f"📚 {genre}", callback_data=f"select_genre:{genre}"))
+
+        builder.row(InlineKeyboardButton(text="✏️ Ввести свой жанр/описание", callback_data="select_genre:custom"))
+        builder.row(InlineKeyboardButton(text="⏭ Пропустить описание", callback_data="skip_description"))
+        builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="wizard_cancel"))
+
         await message.answer(
             f"📝 <b>Шаг 4/6:</b> Описание и жанр\n\n"
-            f"Выберите жанр из списка или введите краткое описание книги:\n\n"
-            f"Можно пропустить этот шаг",
+            f"Выберите жанр из списка или введите описание вручную:",
             reply_markup=builder.as_markup(),
             parse_mode="HTML"
         )
-        
+
     except Exception as e:
         print(f"Error getting genres: {e}")
+        # Фолбек если API недоступно
         await message.answer(
             f"📝 <b>Шаг 4/6:</b> Описание и жанр\n\n"
-            f"Введите краткое описание книги или жанр:",
+            f"Введите жанр или краткое описание книги:",
             reply_markup=cancel_keyboard(),
             parse_mode="HTML"
         )
 
+
+# ==========================================
+# 5. ОПИСАНИЕ И ЖАНР
+# ==========================================
+
+@router.callback_query(F.data == "skip_description", AddBookWizard.description)
+async def skip_description(callback: CallbackQuery, state: FSMContext):
+    await callback.answer("Описание пропущено")
+    await process_description_complete(callback.message, state)
 
 @router.callback_query(F.data.startswith("select_genre:"), AddBookWizard.description)
-async def select_genre(callback: CallbackQuery, state: FSMContext):
-    """
-    Выбор жанра из предложенных (ТЗ 3.1.4)
-    """
-    genre = callback.data.split(":", 1)[1]
-    
+async def select_genre_callback(callback: CallbackQuery, state: FSMContext):
+    genre = callback.data.split(":")[1]
+
     if genre == "custom":
-        # Пользователь хочет ввести свой жанр
         await callback.message.edit_text(
-            "📝 Введите название жанра:",
-            reply_markup=cancel_keyboard(),
-            parse_mode="HTML"
+            "✍️ Введите описание или свой жанр текстом:",
+            reply_markup=cancel_keyboard()
         )
-        await callback.answer()
         return
-    
+
     # Сохраняем выбранный жанр
     data = await state.get_data()
     wizard_data = data.get("wizard_data", {})
     wizard_data["genre"] = genre
+    wizard_data["description"] = f"Жанр: {genre}" # Дефолтное описание
     await state.update_data(wizard_data=wizard_data)
-    
+
     await callback.answer(f"Выбран жанр: {genre}")
-    
-    # Переходим к выбору владельца
     await process_description_complete(callback.message, state)
-
-
-@router.callback_query(F.data == "skip_description", AddBookWizard.description)
-async def skip_description(callback: CallbackQuery, state: FSMContext):
-    """
-    Пропуск описания и жанра
-    """
-    await callback.answer("Описание и жанр пропущены")
-    await process_description_complete(callback.message, state)
-
 
 @router.message(AddBookWizard.description)
 async def process_description(message: Message, state: FSMContext):
-    """
-    Обработка ввода описания (ТЗ 3.1.4)
-    """
     text = message.text.strip()
-    
-    # Валидация
     is_valid, error_msg = validate_description(text)
-    
     if not is_valid:
         await message.answer(error_msg, parse_mode="HTML")
         return
-    
-    # Сохраняем описание
+
     data = await state.get_data()
     wizard_data = data.get("wizard_data", {})
     wizard_data["description"] = text
+    # Если жанр не был выбран кнопкой, ставим "Другое" или пытаемся определить
+    if "genre" not in wizard_data:
+        wizard_data["genre"] = "Другое"
+
     await state.update_data(wizard_data=wizard_data)
-    
     await message.answer("✅ Описание сохранено")
     await process_description_complete(message, state)
 
 
 async def process_description_complete(message: Message, state: FSMContext):
-    """
-    Завершение шага описания, переход к Шагу 5: Выбор владельца
-    """
-    # Шаг 5: Выбор владельца (ТЗ 3.1.5)
+    """Переход к выбору владельца"""
     await state.set_state(AddBookWizard.owner)
-    
     try:
-        # Получаем список пользователей
         users = await api.search_users()
-        
         if not users:
             await message.answer(
-                "❌ Не найдено зарегистрированных пользователей.\n"
-                "Попросите пользователей запустить бота командой /start",
+                "📝 <b>Шаг 5/6:</b> Владелец книги\n\n"
+                "Введите username или имя владельца для поиска:",
+                reply_markup=cancel_keyboard(),
                 parse_mode="HTML"
             )
             return
-        
+
+        # Сохраняем всех пользователей в стейт для быстрого поиска по ID
+        await state.update_data(all_users=users)
+
         await message.answer(
             f"📝 <b>Шаг 5/6:</b> Владелец книги\n\n"
-            f"Выберите владельца книги из списка:\n\n"
-            f"💡 Или введите username/имя для поиска",
+            f"Выберите владельца книги из списка или введите имя для поиска:",
             reply_markup=users_selection_keyboard(users),
             parse_mode="HTML"
         )
-        
-        # Сохраняем список пользователей для поиска
-        await state.update_data(all_users=users)
-        
     except Exception as e:
-        await message.answer("❌ Ошибка загрузки пользователей")
+        await message.answer("❌ Ошибка загрузки списка пользователей. Введите имя вручную.")
         print(f"Error loading users: {e}")
 
 
+# ==========================================
+# 6. ВЛАДЕЛЕЦ
+# ==========================================
+
 @router.message(AddBookWizard.owner)
 async def search_owner(message: Message, state: FSMContext):
-    """
-    Поиск владельца по username или имени (ТЗ 3.1.5)
-    """
     query = message.text.strip()
-    
     if len(query) < 2:
-        await message.answer(
-            "❌ Запрос слишком короткий. Введите минимум 2 символа.",
-            parse_mode="HTML"
-        )
+        await message.answer("❌ Введите минимум 2 символа для поиска.", parse_mode="HTML")
         return
-    
     try:
-        # Ищем пользователей
         users = await api.search_users(query)
-        
         if not users:
-            await message.answer(
-                f"🔍 По запросу <b>«{query}»</b> никто не найден.\n\n"
-                f"Попробуйте другой запрос:",
-                parse_mode="HTML"
-            )
+            await message.answer(f"🔍 Никого не нашли по запросу «{query}».", parse_mode="HTML")
             return
-        
-        await message.answer(
-            f"🔍 Результаты поиска по <b>«{query}»</b>:\n\n"
-            f"Выберите владельца:",
-            reply_markup=users_selection_keyboard(users),
-            parse_mode="HTML"
-        )
-        
-    except Exception as e:
-        await message.answer("❌ Ошибка поиска")
-        print(f"Error searching users: {e}")
 
+        # Обновляем кэш пользователей
+        await state.update_data(all_users=users)
+        await message.answer(f"🔍 Результаты поиска:", reply_markup=users_selection_keyboard(users), parse_mode="HTML")
+    except Exception as e:
+        print(f"Error searching users: {e}")
+        await message.answer("❌ Ошибка поиска")
 
 @router.callback_query(F.data.startswith("select_owner:"), AddBookWizard.owner)
 async def select_owner(callback: CallbackQuery, state: FSMContext):
-    """
-    Выбор владельца книги (ТЗ 3.1.5)
-    """
     owner_id = int(callback.data.split(":")[1])
-    
-    # Получаем данные владельца для отображения
-    try:
-        data = await state.get_data()
-        all_users = data.get("all_users", [])
-        
-        # Ищем выбранного пользователя
-        owner = None
-        for user in all_users:
-            if user["id"] == owner_id:
-                owner = user
-                break
-        
-        # Если не нашли в кэше, запрашиваем через поиск
-        if not owner:
-            users = await api.search_users()
-            for user in users:
-                if user["id"] == owner_id:
-                    owner = user
-                    break
-        
-        if not owner:
-            await callback.answer("Пользователь не найден", show_alert=True)
-            return
-        
-        owner_name = owner.get("username") or owner.get("full_name", "Неизвестный")
-        
-        # Сохраняем владельца
-        wizard_data = data.get("wizard_data", {})
-        wizard_data["owner_id"] = owner_id
-        wizard_data["owner_name"] = owner_name
-        await state.update_data(wizard_data=wizard_data)
-        
-        await callback.answer(f"Выбран: {owner_name}")
-        
-        # Шаг 6: Подтверждение (ТЗ 3.1.6)
-        await process_owner_selected(callback.message, state)
-        
-    except Exception as e:
-        await callback.answer("Ошибка выбора владельца", show_alert=True)
-        print(f"Error selecting owner: {e}")
+    data = await state.get_data()
+    all_users = data.get("all_users", [])
 
+    # Ищем пользователя в сохраненном списке
+    owner = next((u for u in all_users if u["id"] == owner_id), None)
+
+    if not owner:
+        # Если не нашли в кэше, пробуем запросить API
+        try:
+            users = await api.search_users()
+            owner = next((u for u in users if u["id"] == owner_id), None)
+        except: pass
+
+    if not owner:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+
+    owner_name = owner.get("username") or owner.get("full_name", "Неизвестный")
+
+    wizard_data = data.get("wizard_data", {})
+    wizard_data["owner_id"] = owner_id
+    wizard_data["owner_name"] = owner_name
+    await state.update_data(wizard_data=wizard_data)
+
+    await callback.answer(f"Выбран: {owner_name}")
+    await process_owner_selected(callback.message, state)
+
+
+# ==========================================
+# 7. ПОДТВЕРЖДЕНИЕ И СОЗДАНИЕ
+# ==========================================
 
 async def process_owner_selected(message: Message, state: FSMContext):
     """
-    Переход к шагу 6: Подтверждение (ТЗ 3.1.6)
+    Шаг 6: Предпросмотр и подтверждение
     """
     await state.set_state(AddBookWizard.confirm)
-    
-    # Получаем все данные
     data = await state.get_data()
     wizard_data = data.get("wizard_data", {})
-    
-    # Формируем превью
+
     preview_text = format_wizard_preview(wizard_data)
-    
-    # Если есть фото, показываем с фото
-    if wizard_data.get("image_path"):
-        try:
-            image_url = f"{settings.api_url}/{wizard_data['image_path']}"
-            
-            await message.answer_photo(
-                photo=image_url,
-                caption=preview_text,
-                reply_markup=wizard_confirm_keyboard(),
-                parse_mode="HTML"
-            )
-        except:
-            # Если фото не загрузилось
-            await message.answer(
-                preview_text,
-                reply_markup=wizard_confirm_keyboard(),
-                parse_mode="HTML"
-            )
+
+    # Проверка наличия фото
+    photo_bytes = wizard_data.get("photo_bytes")
+
+    if photo_bytes:
+        # Если есть фото, отправляем его с подписью
+        input_file = BufferedInputFile(photo_bytes, filename="preview.jpg")
+        await message.answer_photo(
+            photo=input_file,
+            caption=preview_text,
+            reply_markup=wizard_confirm_keyboard(),
+            parse_mode="HTML"
+        )
     else:
+        # Если фото нет, просто текст
         await message.answer(
             preview_text,
             reply_markup=wizard_confirm_keyboard(),
@@ -509,86 +397,59 @@ async def process_owner_selected(message: Message, state: FSMContext):
 @router.callback_query(F.data == "wizard_confirm", AddBookWizard.confirm)
 async def confirm_and_create_book(callback: CallbackQuery, state: FSMContext):
     """
-    Подтверждение и создание книги (ТЗ 3.1.6)
+    Финальное создание книги
     """
     data = await state.get_data()
     wizard_data = data.get("wizard_data", {})
-    
+    photo_bytes = wizard_data.get("photo_bytes")
+
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("⏳ Создаю книгу, подождите...")
+
     try:
-        # Отправляем данные на API
-        book_data = {
+        book_fields = {
             "title": wizard_data["title"],
             "author": wizard_data["author"],
             "owner_id": wizard_data["owner_id"],
             "description": wizard_data.get("description"),
-            "genre": wizard_data.get("genre", "Другое"),
-            "image_path": wizard_data.get("image_path")
+            "genre": wizard_data.get("genre", "Другое")
         }
-        
-        # Создаем книгу
-        book = await api.create_book(book_data)
-        
-        # Очищаем состояние
+
+        # Отправляем в API
+        # ВАЖНО: api.create_book должен поддерживать аргумент photo_bytes
+        book = await api.create_book(book_fields, photo_bytes=photo_bytes)
+
+        if not book:
+            raise Exception("API вернуло пустой ответ")
+
         await state.clear()
-        
-        # Успешное добавление
-        await callback.message.edit_text(
+
+        result_text = (
             f"✅ <b>Книга успешно добавлена!</b>\n\n"
-            f"📖 {book['title']}\n"
-            f"✍️ {book['author']}\n"
-            f"🔖 ID: #{book['id']:05d}\n\n"
-            f"Книга появится в каталоге",
-            parse_mode="HTML"
+            f"📖 {book.get('title', 'Без названия')}\n"
+            f"🔖 ID: #{book.get('id', '???')}"
         )
-        
-        await callback.answer("Книга добавлена!", show_alert=True)
-        
-        # Отправляем уведомление в группу (если настроена)
-        # API само отправит уведомление через webhook
-        
+
+        await callback.message.answer(
+            result_text,
+            parse_mode="HTML",
+            reply_markup=main_menu_keyboard()
+        )
+
     except Exception as e:
         await callback.answer("Ошибка создания книги", show_alert=True)
-        await callback.message.answer(
-            "❌ Произошла ошибка при добавлении книги.\n"
-            "Попробуйте еще раз позже.",
-            parse_mode="HTML"
-        )
+        await callback.message.answer(f"❌ Ошибка: {str(e)}")
         print(f"Error creating book: {e}")
-
-
-@router.callback_query(F.data == "wizard_edit", AddBookWizard.confirm)
-async def edit_wizard_data(callback: CallbackQuery, state: FSMContext):
-    """
-    Возврат к редактированию данных
-    """
-    await callback.message.edit_text(
-        "✏️ <b>Редактирование</b>\n\n"
-        "Выберите, что хотите изменить:\n\n"
-        "1️⃣ Автор\n"
-        "2️⃣ Название\n"
-        "3️⃣ Фото\n"
-        "4️⃣ Описание/Жанр\n"
-        "5️⃣ Владелец\n\n"
-        "Введите номер (1-5):",
-        reply_markup=cancel_keyboard(),
-        parse_mode="HTML"
-    )
-    # TODO: Можно добавить полноценное редактирование, но это усложнит код
-    # Пока просто отменяем
-    await callback.answer("Функция в разработке. Пожалуйста, начните заново.")
 
 
 @router.callback_query(F.data == "wizard_cancel")
 async def cancel_wizard(callback: CallbackQuery, state: FSMContext):
-    """Отмена визарда"""
     await state.clear()
-
-    user_id = callback.from_user.id  # Исправлено здесь тоже
+    user_id = callback.from_user.id
     is_admin = user_id in settings.admin_ids_list
 
-    await callback.message.edit_text(
-        "❌ Добавление книги отменено\n\n📋 Главное меню",
-        reply_markup=main_menu_keyboard(is_admin),
-        parse_mode="HTML"
+    await callback.message.delete()
+    await callback.message.answer(
+        "❌ Добавление отменено",
+        reply_markup=main_menu_keyboard(is_admin)
     )
-    await callback.answer("Отменено")

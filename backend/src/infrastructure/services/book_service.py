@@ -18,21 +18,29 @@ class LibraryService:
 
     # --- CRUD Книги ---
 
-    async def create_book(self, book_in: BookCreate) -> int:
-        # Проверяем существование владельца
+    async def create_book(self, book_in: BookCreate, photo: UploadFile = None) -> int:
+        # 1. Если прислали фото, сохраняем его
+        if photo:
+            try:
+                book_in.image_path = await image_service.process_and_save(photo)
+            except Exception as e:
+                # В Docker здесь часто падают права доступа. Смотрите логи!
+                print(f"FAILED TO SAVE IMAGE: {e}")
+                book_in.image_path = 'books/base_cover.jpg'
+        else:
+            book_in.image_path = "books/base_cover.jpg"
+        # 2. Проверяем владельца
         if not await self.user_repo.get_by_id(book_in.owner_id):
             raise HTTPException(status_code=404, detail="Владелец не найден")
 
-        # Создаем книгу
+        # 3. Создаем книгу
         book = await self.book_repo.add_book(book_in)
 
-        # Логируем
         await self.book_repo.log_history(
             book.id, book_in.owner_id, BookStatus.AVAILABLE,
             comment="Книга добавлена в каталог"
         )
 
-        # Уведомление в группу о новой книге (ТЗ 3.1.3)
         owner = await self.user_repo.get_by_id(book_in.owner_id)
         owner_username = f"@{owner.username}" if owner.username else owner.full_name
         await notification_service.notify_new_book(book, owner_username)
@@ -49,7 +57,6 @@ class LibraryService:
 
         await self.book_repo.update_book(book_id, update_data)
 
-        # Формируем текст изменений для истории
         changes = []
         if update_data.title: changes.append("название")
         if update_data.author: changes.append("автор")
