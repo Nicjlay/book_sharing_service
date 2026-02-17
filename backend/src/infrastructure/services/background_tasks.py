@@ -14,8 +14,8 @@ from domain.domain_models import BookStatus, NotificationType
 # URL, на который бот слушает входящие уведомления
 # В Docker-сети это может быть http://bot_container:8001/webhook
 # В локальной разработке: http://localhost:8001/webhook
-BOT_WEBHOOK_URL = os.getenv("BOT_WEBHOOK_URL", "http://localhost:8001/webhook")
-API_TOKEN = os.getenv("API_TOKEN", "your-secret-token-change-in-production")
+BOT_WEBHOOK_URL = os.getenv("BOT_WEBHOOK_URL")
+API_TOKEN = os.getenv("API_TOKEN")
 
 
 class NotificationService:
@@ -24,10 +24,32 @@ class NotificationService:
     Push-архитектура: API сам толкает события в бота.
     """
 
+    def __init__(self):
+        # Лог последних уведомлений для отладки (notification_routes.py)
+        self.notifications_queue: list[Dict[str, Any]] = []
+        self._max_queue_size = 200
+
+    def _enqueue(self, payload: Dict[str, Any]):
+        """Добавить уведомление в лог."""
+        self.notifications_queue.append({**payload, "_sent_at": datetime.now().isoformat()})
+        if len(self.notifications_queue) > self._max_queue_size:
+            self.notifications_queue = self.notifications_queue[-self._max_queue_size:]
+
+    def get_notifications(self, user_id: int) -> list[Dict[str, Any]]:
+        """Получить уведомления конкретного пользователя."""
+        return [n for n in self.notifications_queue if n.get("user_id") == user_id]
+
+    def clear_notifications(self, user_id: int):
+        """Удалить уведомления конкретного пользователя из лога."""
+        self.notifications_queue = [
+            n for n in self.notifications_queue if n.get("user_id") != user_id
+        ]
+
     async def _send_http_notification(self, payload: Dict[str, Any]):
         """
         Физическая отправка JSON на эндпоинт бота.
         """
+        self._enqueue(payload)
         async with httpx.AsyncClient() as client:
             try:
                 print(f"📡 PUSH to Bot {payload.get('user_id')}: {payload.get('type')}")
@@ -48,7 +70,7 @@ class NotificationService:
     async def notify_new_book(self, book: Any, owner_username: str):
         """Уведомление в группу о новой книге (ТЗ 3.1.3)"""
         payload = {
-            "type": NotificationType.NEW_BOOK,
+            "type": NotificationType.NEW_BOOK.value,
             "user_id": 0,  # 0 или спец. ID для системных сообщений в группу
             "message": f"📚 Добавлена новая книга: {book.title}",
             "book_id": book.id,
@@ -63,13 +85,13 @@ class NotificationService:
 
     async def notify_owner_about_return(self, book: BookTable, returner_id: int, photo_path: str = None):
         """Уведомление владельцу о возврате книги (ТЗ 3.3.3)"""
-        msg = f"📚 Ваша книга '{book.title}' возвращена (ID {returner_id})."
+        msg = f"📚 Ваша книга '{book.title}' возвращена."
         if photo_path:
             msg += " 📸 Приложено фото состояния."
 
         payload = {
-            "user_id": book.owner_id,
-            "type": NotificationType.BOOK_RETURNED,
+            "user_id": book.owner_id,  # users.id = Telegram ID в этой схеме
+            "type": NotificationType.BOOK_RETURNED.value,
             "message": msg,
             "book_id": book.id,
             "meta": {"photo_path": photo_path, "returner_id": returner_id}
@@ -81,7 +103,7 @@ class NotificationService:
         msg = f"🔥 Книга '{book.title}', которую вы ждали, теперь свободна! Успейте забронировать."
         payload = {
             "user_id": user_id,
-            "type": NotificationType.WAITLIST_AVAILABLE,
+            "type": NotificationType.WAITLIST_AVAILABLE.value,
             "message": msg,
             "book_id": book.id,
             "meta": {}
@@ -93,8 +115,8 @@ class NotificationService:
         date_str = book.return_due_date.strftime("%d.%m.%Y")
         msg = f"✅ Ваша заявка на книгу '{book.title}' одобрена! Вернуть до: {date_str}"
         payload = {
-            "user_id": book.borrower_id,
-            "type": NotificationType.RESERVATION_APPROVED,
+            "user_id": book.borrower_id,  # users.id = Telegram ID в этой схеме
+            "type": NotificationType.RESERVATION_APPROVED.value,
             "message": msg,
             "book_id": book.id,
             "meta": {"due_date": date_str}
@@ -106,7 +128,7 @@ class NotificationService:
         msg = f"❌ Заявка на '{book.title}' отклонена. Причина: {reason}"
         payload = {
             "user_id": user_id,
-            "type": NotificationType.RESERVATION_REJECTED,
+            "type": NotificationType.RESERVATION_REJECTED.value,
             "message": msg,
             "book_id": book.id,
             "meta": {"reason": reason}
@@ -118,8 +140,8 @@ class NotificationService:
         # Уведомление заемщику
         msg_user = f"🚨 СРОК ВЫШЕЛ: Книга '{book.title}' просрочена! Верните её немедленно."
         payload_user = {
-            "user_id": book.borrower_id,
-            "type": NotificationType.OVERDUE,
+            "user_id": book.borrower_id,  # users.id = Telegram ID в этой схеме
+            "type": NotificationType.OVERDUE.value,
             "message": msg_user,
             "book_id": book.id,
             "meta": {"is_owner": False}
@@ -129,8 +151,8 @@ class NotificationService:
         # Уведомление владельцу
         msg_owner = f"🚨 ВНИМАНИЕ: Книга '{book.title}' просрочена читателем (ID {book.borrower_id})."
         payload_owner = {
-            "user_id": book.owner_id,
-            "type": NotificationType.OVERDUE,
+            "user_id": book.owner_id,  # users.id = Telegram ID в этой схеме
+            "type": NotificationType.OVERDUE.value,
             "message": msg_owner,
             "book_id": book.id,
             "meta": {"is_owner": True}
@@ -141,7 +163,7 @@ class NotificationService:
         """Напоминание о приближающемся сроке возврата"""
         msg = f"⏰ Напоминание: Книгу '{book.title}' нужно вернуть через {days_left} дн."
         payload = {
-            "user_id": book.borrower_id,
+            "user_id": book.borrower_id,  # users.id = Telegram ID в этой схеме
             "type": "due_date_reminder",
             "message": msg,
             "book_id": book.id,
@@ -159,6 +181,7 @@ class NotificationService:
               f"Автор: {book.author}\n" \
               f"Пользователь: ID{user_id}\n" \
               f"Срок: {days} дней"
+        # user_id здесь — Telegram ID пользователя, передаётся из хэндлера
 
         payload = {
             "user_id": -1,  # -1 означает "всем админам"

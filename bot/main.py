@@ -9,7 +9,6 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 import uvicorn
-from threading import Thread
 
 from config import settings
 import webhook as webhook_module
@@ -35,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 async def main():
     """Главная функция запуска бота"""
-    
+
     # Инициализация бота и диспетчера
     bot = Bot(
         token=settings.bot_token,
@@ -43,7 +42,7 @@ async def main():
     )
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
-    
+
     # Регистрация handlers
     dp.include_router(start.router)
     dp.include_router(catalog.router)
@@ -51,30 +50,27 @@ async def main():
     dp.include_router(reservation.router)
     dp.include_router(admin.router)
     dp.include_router(my_books.router)
-    
+
     # Устанавливаем бота в webhook модуль
     webhook_module.set_bot(bot)
-    
-    # Запускаем webhook сервер в отдельном потоке
-    def run_webhook():
-        uvicorn.run(
-            webhook_module.app,
-            host=settings.webhook_host,
-            port=settings.webhook_port,
-            log_level="info"
-        )
-    
-    webhook_thread = Thread(target=run_webhook, daemon=True)
-    webhook_thread.start()
-    
+
+    config = uvicorn.Config(
+        webhook_module.app,
+        host=settings.webhook_host,
+        port=settings.webhook_port,
+        log_level="info"
+    )
+    server = uvicorn.Server(config)
+    asyncio.create_task(server.serve())
+
     logger.info("🚀 Bot started!")
     logger.info(f"📡 Webhook listening on {settings.webhook_host}:{settings.webhook_port}")
     logger.info(f"🔗 API endpoint: {settings.api_url}")
     logger.info(f"👨‍💼 Admins: {settings.admin_ids_list}")
-    
+
     # Удаляем старый webhook (если был)
     await bot.delete_webhook(drop_pending_updates=True)
-    
+
     # Запускаем polling
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())

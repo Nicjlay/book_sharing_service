@@ -43,7 +43,10 @@ class LibraryService:
 
         owner = await self.user_repo.get_by_id(book_in.owner_id)
         owner_username = f"@{owner.username}" if owner.username else owner.full_name
-        await notification_service.notify_new_book(book, owner_username)
+        try:
+            await notification_service.notify_new_book(book, owner_username)
+        except Exception as e:
+            print(f"⚠️ notify_new_book failed (non-fatal): {e}")
 
         return book.id
 
@@ -113,7 +116,10 @@ class LibraryService:
         )
 
         # Отправляем уведомление админу о новой заявке (ТЗ 3.2.3)
-        await notification_service.notify_admin_about_reservation(book, user_id, days)
+        try:
+            await notification_service.notify_admin_about_reservation(book, user_id, days)
+        except Exception as e:
+            print(f"⚠️ notify_admin_about_reservation failed (non-fatal): {e}")
 
         return {"status": "reserved_pending_approval"}
 
@@ -131,7 +137,10 @@ class LibraryService:
         )
 
         # Уведомляем пользователя об одобрении (ТЗ 3.2.3)
-        await notification_service.notify_reservation_approved(book)
+        try:
+            await notification_service.notify_reservation_approved(book)
+        except Exception as e:
+            print(f"⚠️ notify_reservation_approved failed (non-fatal): {e}")
         return book
 
     async def reject_reservation(self, book_id: int, admin_id: int, reason: str):
@@ -151,7 +160,10 @@ class LibraryService:
 
         # Уведомляем пользователя об отказе
         if borrower_id:
-            await notification_service.notify_reservation_rejected(book, borrower_id, reason)
+            try:
+                await notification_service.notify_reservation_rejected(book, borrower_id, reason)
+            except Exception as e:
+                print(f"⚠️ notify_reservation_rejected failed (non-fatal): {e}")
 
     # --- Бизнес-процесс: Возврат ---
 
@@ -188,12 +200,18 @@ class LibraryService:
         # 3. Уведомление Владельцу (ТЗ 3.3.3)
         # Если вернул не владелец, уведомляем его
         if not is_owner and book.owner_id:
-            await notification_service.notify_owner_about_return(book, user_id, photo_path)
+            try:
+                await notification_service.notify_owner_about_return(book, user_id, photo_path)
+            except Exception as e:
+                print(f"⚠️ notify_owner_about_return failed (non-fatal): {e}")
 
         # 4. Обработка Waitlist (ТЗ 3.2.2 -> 4.3)
         waiters = await self.book_repo.get_waitlist_users(book_id)
         for waiter_id in waiters:
-            await notification_service.notify_waitlist_available(book, waiter_id)
+            try:
+                await notification_service.notify_waitlist_available(book, waiter_id)
+            except Exception as e:
+                print(f"⚠️ notify_waitlist_available failed (non-fatal): {e}")
 
         # Очищаем очередь, так как уведомления ушли
         if waiters:

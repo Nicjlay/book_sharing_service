@@ -102,19 +102,29 @@ def format_history(history: List[Dict]) -> str:
     text = "📜 <b>История книги:</b>\n\n"
     
     for entry in history:
-        date = datetime.fromisoformat(entry["created_at"].replace("Z", "+00:00"))
-        date_str = date.strftime("%d.%m.%Y %H:%M")
-        
+        raw_date = entry.get("created_at") or entry.get("date") or entry.get("timestamp")
+        if raw_date:
+            try:
+                date = datetime.fromisoformat(str(raw_date).replace("Z", "+00:00"))
+                date_str = date.strftime("%d.%m.%Y %H:%M")
+            except (ValueError, TypeError):
+                date_str = str(raw_date)
+        else:
+            date_str = "-"
+
         comment = entry.get("comment", "")
-        
-        text += f"📅 {date_str}\n"
-        text += f"   {comment}\n"
-        
+        status = entry.get("status_to") or entry.get("status", "")
+
+        text += f"📅 {date_str}" + "\n"
+        if comment:
+            text += "   " + comment + "\n"
+        elif status:
+            text += "   " + status + "\n"
+
         if entry.get("photo_proof_path"):
-            text += f"   📸 Фото приложено\n"
-        
+            text += "   📸 Фото приложено\n"
+
         text += "\n"
-    
     return text
 
 
@@ -125,23 +135,23 @@ def format_wizard_preview(data: Dict) -> str:
     text = "📖 <b>Предпросмотр книги</b>\n\n"
     text += f"<b>Название:</b> {data.get('title', 'Не указано')}\n"
     text += f"<b>Автор:</b> {data.get('author', 'Не указано')}\n"
-    
+
     if data.get("genre"):
         text += f"<b>Жанр:</b> {data['genre']}\n"
-    
+
     if data.get("description"):
         text += f"<b>Описание:</b> {data['description']}\n"
-    
+
     owner_name = data.get("owner_name", "Не выбран")
     text += f"<b>Владелец:</b> {owner_name}\n"
-    
+
     if data.get("image_path"):
         text += f"\n✅ Фото обложки загружено"
     else:
         text += f"\n⚠️ Фото обложки не загружено (будет использована заглушка)"
-    
+
     text += "\n\n<b>Всё верно?</b>"
-    
+
     return text
 
 
@@ -151,12 +161,12 @@ def format_my_books(books: List[Dict], user_id: int) -> str:
     """
     if not books:
         return "📚 У вас пока нет книг"
-    
+
     owned = [b for b in books if b.get("owner_id") == user_id]
     borrowed = [b for b in books if b.get("borrower_id") == user_id]
-    
+
     text = "📚 <b>Мои книги:</b>\n\n"
-    
+
     if owned:
         text += "🏠 <b>Мои книги (владелец):</b>\n"
         for book in owned:
@@ -164,7 +174,7 @@ def format_my_books(books: List[Dict], user_id: int) -> str:
             emoji = status_emoji.get(book.get("status"), "⚪️")
             text += f"{emoji} {book['title']} (ID: #{book['id']:05d})\n"
         text += "\n"
-    
+
     if borrowed:
         text += "📖 <b>Книги на руках:</b>\n"
         for book in borrowed:
@@ -172,11 +182,11 @@ def format_my_books(books: List[Dict], user_id: int) -> str:
             if book.get("return_due_date"):
                 date = datetime.fromisoformat(book["return_due_date"].replace("Z", "+00:00"))
                 due_date = f" - до {date.strftime('%d.%m.%Y')}"
-            
+
             status_emoji = {"borrowed": "🔴", "overdue": "⏳"}
             emoji = status_emoji.get(book.get("status"), "📖")
             text += f"{emoji} {book['title']}{due_date} (ID: #{book['id']:05d})\n"
-    
+
     return text
 
 
@@ -186,7 +196,7 @@ def format_notification(notification: Dict) -> str:
     """
     msg_type = notification.get("type")
     message = notification.get("message", "")
-    
+
     # Добавляем emoji в зависимости от типа
     emoji_map = {
         "reservation_approved": "✅",
@@ -197,9 +207,9 @@ def format_notification(notification: Dict) -> str:
         "new_book": "📖",
         "due_date_reminder": "⏰"
     }
-    
+
     emoji = emoji_map.get(msg_type, "📢")
-    
+
     return f"{emoji} <b>Уведомление</b>\n\n{message}"
 
 

@@ -4,7 +4,6 @@
 """
 from fastapi import APIRouter
 
-from infrastructure.db.session import get_db
 from infrastructure.services.background_tasks import notification_service
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
