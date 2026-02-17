@@ -9,28 +9,10 @@ from aiogram.fsm.context import FSMContext
 from api.client import api
 from keyboards.inline import main_menu_keyboard
 from config import settings
+from utils.telegram import safe_edit_message
+
 
 router = Router()
-
-
-async def safe_edit_message(message, text: str, reply_markup=None, parse_mode: str = "HTML"):
-    """
-    Универсальное редактирование сообщения.
-    Карточки книг с фото — это photo-сообщения, у них нет text, только caption.
-    edit_text() на них → Bad Request: there is no text in the message to edit.
-    """
-    if message.photo or message.document or message.sticker:
-        await message.edit_caption(
-            caption=text,
-            reply_markup=reply_markup,
-            parse_mode=parse_mode
-        )
-    else:
-        await message.edit_text(
-            text,
-            reply_markup=reply_markup,
-            parse_mode=parse_mode
-        )
 
 
 @router.message(CommandStart())

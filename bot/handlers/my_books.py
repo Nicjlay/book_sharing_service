@@ -9,6 +9,7 @@ from aiogram.fsm.context import FSMContext
 from api.client import api
 from keyboards.inline import book_card_keyboard, main_menu_keyboard
 from utils.formatters import format_my_books, format_history
+from utils.telegram import safe_edit_message
 from config import settings
 
 router = Router()
@@ -148,26 +149,6 @@ async def show_book_history(callback: CallbackQuery):
         await callback.answer("Ошибка загрузки истории", show_alert=True)
         print(f"Error loading history: {e}")
 
-
-async def safe_edit_message(message, text: str, reply_markup=None, parse_mode="HTML"):
-    """
-    Универсальное редактирование сообщения.
-    Карточки книг с фото — это photo-сообщения без текста.
-    edit_text() на них падает с "there is no text in the message to edit".
-    Решение: для фото используем edit_caption(), для текста — edit_text().
-    """
-    if message.photo or message.document or message.sticker:
-        await message.edit_caption(
-            caption=text,
-            reply_markup=reply_markup,
-            parse_mode=parse_mode
-        )
-    else:
-        await message.edit_text(
-            text,
-            reply_markup=reply_markup,
-            parse_mode=parse_mode
-        )
 
 
 @router.callback_query(F.data.startswith("delete:"))

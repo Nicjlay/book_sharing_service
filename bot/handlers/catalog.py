@@ -3,7 +3,7 @@ Handler для просмотра каталога книг (ТЗ 3.2.1)
 """
 from aiogram import Router, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, InputMediaPhoto, BufferedInputFile
+from aiogram.types import Message, CallbackQuery, BufferedInputFile
 from aiogram.fsm.context import FSMContext
 
 from api.client import api
@@ -16,6 +16,7 @@ from keyboards.inline import (
     cancel_keyboard
 )
 from utils.formatters import format_book_card, format_book_list
+from utils.telegram import safe_edit_message
 from config import settings
 from states.wizard import SearchStates
 import os
@@ -42,29 +43,6 @@ async def get_photo_input(image_path: str) -> BufferedInputFile | None:
         return BufferedInputFile(photo_bytes, filename=os.path.basename(image_path))
 
     return None
-
-
-async def safe_edit_message(message, text: str, reply_markup=None, parse_mode: str = "HTML"):
-    """
-    Универсальное редактирование сообщения.
-
-    Карточки книг с обложкой — это photo-сообщения (answer_photo).
-    У них нет поля text, только caption.
-    Вызов edit_text() на таком сообщении → Bad Request: there is no text in the message to edit.
-    Решение: для фото используем edit_caption(), для текста — edit_text().
-    """
-    if message.photo or message.document or message.sticker:
-        await message.edit_caption(
-            caption=text,
-            reply_markup=reply_markup,
-            parse_mode=parse_mode
-        )
-    else:
-        await message.edit_text(
-            text,
-            reply_markup=reply_markup,
-            parse_mode=parse_mode
-        )
 
 
 @router.message(Command("catalog"))

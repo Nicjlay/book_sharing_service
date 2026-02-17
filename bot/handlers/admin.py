@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from api.client import api
 from keyboards.inline import admin_panel_keyboard, book_card_keyboard, cancel_keyboard
 from utils.formatters import format_book_card
+from utils.telegram import safe_edit_message
 from config import settings
 from states.wizard import AdminRejectStates, AdminApproveStates
 import os
@@ -71,10 +72,10 @@ async def show_admin_panel(event: Message | CallbackQuery, **kwargs):
     )
 
     if isinstance(event, CallbackQuery):
-        await event.message.edit_text(
+        await safe_edit_message(
+            event.message,
             text,
-            reply_markup=admin_panel_keyboard(),
-            parse_mode="HTML"
+            reply_markup=admin_panel_keyboard()
         )
         await event.answer()
     else:
@@ -95,11 +96,11 @@ async def show_pending_reservations(callback: CallbackQuery, state: FSMContext, 
         books = await api.get_pending_reservations()
 
         if not books:
-            await callback.message.edit_text(
+            await safe_edit_message(
+                callback.message,
                 "📋 <b>Заявки на бронирование</b>\n\n"
                 "📭 Нет ожидающих заявок",
-                reply_markup=admin_panel_keyboard(),
-                parse_mode="HTML"
+                reply_markup=admin_panel_keyboard()
             )
             await callback.answer()
             return
@@ -179,16 +180,16 @@ async def show_reservation_request(message: Message, book: dict, index: int, tot
                 parse_mode="HTML"
             )
         except:
-            await message.edit_text(
+            await safe_edit_message(
+                message,
                 text,
-                reply_markup=builder.as_markup(),
-                parse_mode="HTML"
+                reply_markup=builder.as_markup()
             )
     else:
-        await message.edit_text(
+        await safe_edit_message(
+            message,
             text,
-            reply_markup=builder.as_markup(),
-            parse_mode="HTML"
+            reply_markup=builder.as_markup()
         )
 
 
@@ -252,11 +253,11 @@ async def approve_reservation(callback: CallbackQuery, state: FSMContext):
         InlineKeyboardButton(text="❌ Отмена", callback_data="admin_reservations")
     )
 
-    await callback.message.edit_text(
+    await safe_edit_message(
+        callback.message,
         "✅ <b>Подтверждение выдачи</b>\n\n"
         "Выберите дату возврата:",
-        reply_markup=builder.as_markup(),
-        parse_mode="HTML"
+        reply_markup=builder.as_markup()
     )
     await callback.answer()
 
@@ -283,12 +284,12 @@ async def set_due_date_and_approve(callback: CallbackQuery, state: FSMContext):
 
         await state.clear()
 
-        await callback.message.edit_text(
+        await safe_edit_message(
+            callback.message,
             f"✅ <b>Выдача подтверждена!</b>\n\n"
             f"📖 Книга: {book['title']}\n"
             f"📅 Вернуть до: {due_date.strftime('%d.%m.%Y')}\n\n"
-            f"Пользователь получил уведомление.",
-            parse_mode="HTML"
+            f"Пользователь получил уведомление."
         )
         await callback.answer("Выдача подтверждена!", show_alert=True)
 
@@ -311,12 +312,12 @@ async def reject_reservation(callback: CallbackQuery, state: FSMContext):
     await state.update_data(reject_book_id=book_id)
     await state.set_state(AdminRejectStates.reason)
 
-    await callback.message.edit_text(
+    await safe_edit_message(
+        callback.message,
         "❌ <b>Отклонение заявки</b>\n\n"
         "Введите причину отклонения (будет отправлена пользователю):\n\n"
         "Например: <i>Книга повреждена</i> или <i>Книга временно недоступна</i>",
-        reply_markup=cancel_keyboard(),
-        parse_mode="HTML"
+        reply_markup=cancel_keyboard()
     )
     await callback.answer()
 

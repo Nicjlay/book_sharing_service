@@ -15,6 +15,7 @@ from keyboards.inline import (
     cancel_keyboard
 )
 from utils.validators import validate_days
+from utils.telegram import safe_edit_message
 from config import settings
 
 router = Router()
@@ -29,34 +30,34 @@ async def start_reservation(callback: CallbackQuery, state: FSMContext):
     """
     book_id = int(callback.data.split(":")[1])
     user_id = callback.from_user.id
-    
+
     try:
         # Проверяем, что книга существует и доступна
         book = await api.get_book(book_id)
-        
+
         if not book:
             await callback.answer("Книга не найдена", show_alert=True)
             return
-        
+
         if book["status"] != "available":
             await callback.answer("Книга уже занята", show_alert=True)
             return
-        
+
         # Сохраняем book_id в состояние
         await state.update_data(reserve_book_id=book_id)
         await state.set_state(ReservationStates.select_days)
-        
+
         # Предлагаем выбрать срок
-        await callback.message.edit_text(
+        await safe_edit_message(
+            callback.message,
             f"📖 <b>{book['title']}</b>\n"
             f"✍️ {book['author']}\n\n"
             f"📅 <b>Выберите срок бронирования:</b>\n\n"
             f"На какой срок вы хотите взять книгу?",
-            reply_markup=reservation_days_keyboard(),
-            parse_mode="HTML"
+            reply_markup=reservation_days_keyboard()
         )
         await callback.answer()
-        
+
     except Exception as e:
         await callback.answer("Ошибка бронирования", show_alert=True)
         print(f"Error in start_reservation: {e}")
@@ -68,20 +69,20 @@ async def select_reservation_days(callback: CallbackQuery, state: FSMContext):
     Выбор срока бронирования (ТЗ 3.2.2)
     """
     days_str = callback.data.split(":")[1]
-    
+
     if days_str == "custom":
         # Пользователь хочет ввести свой срок
-        await callback.message.edit_text(
+        await safe_edit_message(
+            callback.message,
             "✏️ Введите количество дней (1-90):",
-            reply_markup=cancel_keyboard(),
-            parse_mode="HTML"
+            reply_markup=cancel_keyboard()
         )
         await state.set_state(ReservationStates.custom_days)
         await callback.answer()
         return
-    
+
     days = int(days_str)
-    
+
     # Отправляем запрос на бронирование
     await process_reservation_request(callback, state, days)
 
@@ -92,25 +93,25 @@ async def process_custom_days(message: Message, state: FSMContext):
     Обработка ввода произвольного срока
     """
     is_valid, days, error_msg = validate_days(message.text)
-    
+
     if not is_valid:
         await message.answer(error_msg, parse_mode="HTML")
         return
-    
+
     # Создаем "фейковый" callback для использования общей функции
     # На самом деле отправляем запрос
     data = await state.get_data()
     book_id = data.get("reserve_book_id")
     user_id = message.from_user.id
-    
+
     try:
         result = await api.request_reservation(book_id, user_id, days)
-        
+
         await state.clear()
-        
+
         # Уведомление пользователю
         due_date = (datetime.now() + timedelta(days=days)).strftime("%d.%m.%Y")
-        
+
         await message.answer(
             f"✅ <b>Запрос на бронирование отправлен!</b>\n\n"
             f"📅 Желаемый срок: {days} дней (до {due_date})\n\n"
@@ -118,7 +119,7 @@ async def process_custom_days(message: Message, state: FSMContext):
             f"Вы получите уведомление, когда заявка будет обработана.",
             parse_mode="HTML"
         )
-        
+
     except Exception as e:
         if "409" in str(e):
             # Книга занята - предлагаем waitlist
@@ -139,36 +140,32 @@ async def process_reservation_request(callback: CallbackQuery, state: FSMContext
     data = await state.get_data()
     book_id = data.get("reserve_book_id")
     user_id = callback.from_user.id
-    
+
     try:
         result = await api.request_reservation(book_id, user_id, days)
-        
+
         await state.clear()
-        
+
         # Уведомление пользователю
         due_date = (datetime.now() + timedelta(days=days)).strftime("%d.%m.%Y")
-        
-        await callback.message.edit_text(
+
+        await safe_edit_message(
+            callback.message,
             f"✅ <b>Запрос на бронирование отправлен!</b>\n\n"
             f"📅 Желаемый срок: {days} дней (до {due_date})\n\n"
             f"⏳ Ожидайте подтверждения от администратора.\n"
-            f"Вы получите уведомление, когда заявка будет обработана.",
-            parse_mode="HTML"
+            f"Вы получите уведомление, когда заявка будет обработана."
         )
         await callback.answer("Запрос отправлен!", show_alert=True)
-        
-        # API автоматически отправит уведомление админам через webhook
-        
+
     except Exception as e:
         error_str = str(e)
-        
+
         if "409" in error_str or "занята" in error_str.lower():
-            # Книга занята - предлагаем waitlist
-            await callback.message.edit_text(
+            await safe_edit_message(
+                callback.message,
                 f"❌ <b>Книга уже забронирована</b>\n\n"
-                f"🔔 Хотите получить уведомление, когда она освободится?",
-                reply_markup=None,
-                parse_mode="HTML"
+                f"🔔 Хотите получить уведомление, когда она освободится?"
             )
             await callback.answer()
         else:
@@ -185,18 +182,18 @@ async def join_waitlist(callback: CallbackQuery):
     """
     book_id = int(callback.data.split(":")[1])
     user_id = callback.from_user.id
-    
+
     try:
         await api.join_waitlist(book_id, user_id)
-        
-        await callback.message.edit_text(
+
+        await safe_edit_message(
+            callback.message,
             f"🔔 <b>Вы добавлены в лист ожидания!</b>\n\n"
             f"Когда книга освободится, вы получите уведомление.\n\n"
-            f"💡 Успейте первым забронировать её!",
-            parse_mode="HTML"
+            f"💡 Успейте первым забронировать её!"
         )
         await callback.answer("Добавлено в лист ожидания", show_alert=True)
-        
+
     except Exception as e:
         await callback.answer("Ошибка добавления в лист ожидания", show_alert=True)
         print(f"Error joining waitlist: {e}")
@@ -212,15 +209,15 @@ async def start_return_book(callback: CallbackQuery, state: FSMContext):
     book_id = int(callback.data.split(":")[1])
     user_id = callback.from_user.id
     is_admin = user_id in settings.admin_ids_list
-    
+
     try:
         # Проверяем права на возврат
         book = await api.get_book(book_id)
-        
+
         if not book:
             await callback.answer("Книга не найдена", show_alert=True)
             return
-        
+
         # Проверяем права на возврат — сравниваем Telegram ID, не DB id
         is_borrower = book.get("borrower_tg_id") == user_id
         is_owner = book.get("owner_tg_id") == user_id
@@ -234,14 +231,14 @@ async def start_return_book(callback: CallbackQuery, state: FSMContext):
         await state.set_state(ReturnBookStates.upload_photo)
 
         # Запрашиваем фото (ТЗ 3.3.2)
-        await callback.message.edit_text(
+        await safe_edit_message(
+            callback.message,
             f"📖 <b>{book['title']}</b>\n\n"
             f"📸 <b>Возврат книги</b>\n\n"
             f"Загрузите фотографию книги для подтверждения возврата.\n\n"
             f"💡 Это поможет владельцу проверить состояние книги.\n\n"
             f"Можно пропустить этот шаг.",
-            reply_markup=return_photo_keyboard(),
-            parse_mode="HTML"
+            reply_markup=return_photo_keyboard()
         )
         await callback.answer()
 
