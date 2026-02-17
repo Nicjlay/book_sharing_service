@@ -60,8 +60,10 @@ class BookRead(BookBase):
     # Дополнительные поля для UI (заполняются в эндпоинтах)
     owner_username: Optional[str] = None
     owner_full_name: Optional[str] = None
+    owner_tg_id: Optional[int] = None      # Telegram ID владельца — для проверки прав в боте
     borrower_username: Optional[str] = None
     borrower_full_name: Optional[str] = None
+    borrower_tg_id: Optional[int] = None   # Telegram ID заёмщика — для проверки прав возврата
 
     class Config:
         from_attributes = True
@@ -70,6 +72,7 @@ class BookRead(BookBase):
 # --- Пользователи ---
 class UserRead(BaseModel):
     id: int
+    tg_id: int          # Telegram ID — нужен боту для сравнения владельца
     full_name: str
     username: Optional[str] = None
     is_admin: bool

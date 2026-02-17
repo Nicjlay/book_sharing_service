@@ -13,6 +13,7 @@ from utils.formatters import format_book_card
 from config import settings
 from states.wizard import AdminRejectStates, AdminApproveStates
 import os
+import functools
 
 router = Router()
 
@@ -35,7 +36,15 @@ async def get_photo_input(image_path: str) -> BufferedInputFile | None:
 
 
 def admin_only(func):
-    """Декоратор для проверки прав админа"""
+    """
+    Декоратор для проверки прав админа.
+
+    ВАЖНО: @functools.wraps(func) обязателен.
+    Aiogram 3.x использует inspect.signature() для dependency injection —
+    без wraps он видит сигнатуру wrapper'а (event, *args, **kwargs)
+    вместо оригинальной, и не инжектирует state: FSMContext и другие зависимости.
+    """
+    @functools.wraps(func)
     async def wrapper(event: Message | CallbackQuery, *args, **kwargs):
         user_id = event.from_user.id
         if user_id not in settings.admin_ids_list:

@@ -160,7 +160,7 @@ class APIClient:
             data.add_field(
                 "photo",
                 photo_bytes,
-                filename="cover.jpg",
+                filename="base_cover.jpg",
                 content_type="image/jpeg"
             )
 
@@ -188,6 +188,25 @@ class APIClient:
     # =========================================
     # RESERVATIONS
     # =========================================
+
+    async def get_pending_reservations(self) -> List[Dict]:
+        """
+        Получить список заявок на бронирование (книги со статусом reserved).
+        Используется в админ-панели для обработки заявок.
+        """
+        return await self._request("GET", "/admin/pending-reservations") or []
+
+    async def join_waitlist(self, book_id: int, user_id: int) -> Dict:
+        """Добавить пользователя в лист ожидания книги."""
+        return await self._request(
+            "POST",
+            f"/books/{book_id}/waitlist",
+            params={"user_id": user_id}
+        )
+
+    async def get_book_history(self, book_id: int) -> List[Dict]:
+        """Получить историю операций по книге (ТЗ 4.4)."""
+        return await self._request("GET", f"/books/{book_id}/history") or []
 
     async def request_reservation(self, book_id: int, user_id: int, days: int = 14) -> Dict:
         return await self._request(

@@ -221,17 +221,18 @@ async def start_return_book(callback: CallbackQuery, state: FSMContext):
             await callback.answer("Книга не найдена", show_alert=True)
             return
         
-        is_borrower = book.get("borrower_id") == user_id
-        is_owner = book.get("owner_id") == user_id
-        
+        # Проверяем права на возврат — сравниваем Telegram ID, не DB id
+        is_borrower = book.get("borrower_tg_id") == user_id
+        is_owner = book.get("owner_tg_id") == user_id
+
         if not (is_borrower or is_owner or is_admin):
             await callback.answer("У вас нет прав на возврат этой книги", show_alert=True)
             return
-        
+
         # Сохраняем book_id
         await state.update_data(return_book_id=book_id)
         await state.set_state(ReturnBookStates.upload_photo)
-        
+
         # Запрашиваем фото (ТЗ 3.3.2)
         await callback.message.edit_text(
             f"📖 <b>{book['title']}</b>\n\n"
@@ -243,7 +244,7 @@ async def start_return_book(callback: CallbackQuery, state: FSMContext):
             parse_mode="HTML"
         )
         await callback.answer()
-        
+
     except Exception as e:
         await callback.answer("Ошибка возврата", show_alert=True)
         print(f"Error in start_return: {e}")
@@ -264,15 +265,15 @@ async def process_return_photo(message: Message, state: FSMContext):
     Обработка фото при возврате
     """
     photo = message.photo[-1]
-    
+
     try:
         # Скачиваем фото
         file = await message.bot.download(photo.file_id)
         photo_data = file.read()
-        
+
         await message.answer("✅ Фото получено, обрабатываем возврат...")
         await process_book_return(message, message.from_user.id, state, photo_data)
-        
+
     except Exception as e:
         await message.answer("❌ Ошибка обработки фото")
         print(f"Error processing return photo: {e}")
@@ -297,23 +298,23 @@ async def process_book_return(message: Message, user_id: int, state: FSMContext,
     data = await state.get_data()
     book_id = data.get("return_book_id")
     is_admin = user_id in settings.admin_ids_list
-    
+
     try:
         result = await api.return_book(book_id, user_id, is_admin, photo_data)
-        
+
         await state.clear()
-        
+
         await message.answer(
             f"✅ <b>Книга успешно возвращена!</b>\n\n"
             f"Книга снова доступна в каталоге.\n"
             f"Владелец получил уведомление о возврате.",
             parse_mode="HTML"
         )
-        
+
         # API автоматически:
         # 1. Отправит уведомление владельцу
         # 2. Уведомит пользователей из waitlist
-        
+
     except Exception as e:
         await message.answer("❌ Ошибка возврата книги")
         print(f"Error returning book: {e}")

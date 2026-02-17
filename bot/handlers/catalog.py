@@ -22,9 +22,6 @@ import os
 
 router = Router()
 
-# Папка с медиафайлами внутри контейнера бота.
-# В docker-compose оба контейнера монтируют одну и ту же папку хоста,
-# поэтому бот читает файлы напрямую с диска — быстро и без HTTP.
 MEDIA_ROOT = os.getenv("MEDIA_UPLOAD_DIR", "/app/media")
 
 
@@ -32,21 +29,42 @@ async def get_photo_input(image_path: str) -> BufferedInputFile | None:
     """
     Читает обложку книги.
     1. Сначала пробует прочитать файл напрямую с диска (shared volume).
-    2. Если файл не найден (например, разные серверы) — скачивает через API.
+    2. Если файл не найден — скачивает через API.
     """
-    # image_path приходит как "books/uuid.webp"
     full_path = os.path.join(MEDIA_ROOT, image_path)
 
     if os.path.exists(full_path):
         with open(full_path, "rb") as f:
             return BufferedInputFile(f.read(), filename=os.path.basename(full_path))
 
-    # Fallback: HTTP-загрузка (для будущего случая разных серверов)
     photo_bytes = await api.get_image_bytes(image_path)
     if photo_bytes:
         return BufferedInputFile(photo_bytes, filename=os.path.basename(image_path))
 
     return None
+
+
+async def safe_edit_message(message, text: str, reply_markup=None, parse_mode: str = "HTML"):
+    """
+    Универсальное редактирование сообщения.
+
+    Карточки книг с обложкой — это photo-сообщения (answer_photo).
+    У них нет поля text, только caption.
+    Вызов edit_text() на таком сообщении → Bad Request: there is no text in the message to edit.
+    Решение: для фото используем edit_caption(), для текста — edit_text().
+    """
+    if message.photo or message.document or message.sticker:
+        await message.edit_caption(
+            caption=text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode
+        )
+    else:
+        await message.edit_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode
+        )
 
 
 @router.message(Command("catalog"))
@@ -63,10 +81,10 @@ async def show_catalog(event: Message | CallbackQuery, state: FSMContext):
     )
 
     if isinstance(event, CallbackQuery):
-        await event.message.edit_text(
+        await safe_edit_message(
+            event.message,
             text,
-            reply_markup=catalog_filters_keyboard(),
-            parse_mode="HTML"
+            reply_markup=catalog_filters_keyboard()
         )
         await event.answer()
     else:
@@ -96,12 +114,11 @@ async def apply_filter(callback: CallbackQuery, state: FSMContext):
             title = "🟢 Доступные книги"
 
         elif filter_type == "genres":
-            # Показываем список жанров
             genres = await api.get_genres()
-            await callback.message.edit_text(
+            await safe_edit_message(
+                callback.message,
                 "📖 <b>Выберите жанр:</b>",
-                reply_markup=genres_keyboard(genres),
-                parse_mode="HTML"
+                reply_markup=genres_keyboard(genres)
             )
             await callback.answer()
             return
@@ -111,10 +128,10 @@ async def apply_filter(callback: CallbackQuery, state: FSMContext):
             return
 
         if not books:
-            await callback.message.edit_text(
+            await safe_edit_message(
+                callback.message,
                 f"{title}\n\n📭 Книги не найдены",
-                reply_markup=catalog_filters_keyboard(),
-                parse_mode="HTML"
+                reply_markup=catalog_filters_keyboard()
             )
             await callback.answer()
             return
@@ -143,10 +160,10 @@ async def filter_by_genre(callback: CallbackQuery, state: FSMContext):
         title = f"📚 Жанр: {genre}"
 
         if not books:
-            await callback.message.edit_text(
+            await safe_edit_message(
+                callback.message,
                 f"{title}\n\n📭 Книги не найдены",
-                reply_markup=catalog_filters_keyboard(),
-                parse_mode="HTML"
+                reply_markup=catalog_filters_keyboard()
             )
             await callback.answer()
             return
@@ -222,10 +239,10 @@ async def show_books_page(message: Message, books: list, page: int, title: str, 
         InlineKeyboardButton(text="🔙 К фильтрам", callback_data="catalog")
     )
 
-    await message.edit_text(
+    await safe_edit_message(
+        message,
         text,
-        reply_markup=builder.as_markup(),
-        parse_mode="HTML"
+        reply_markup=builder.as_markup()
     )
 
 
@@ -280,16 +297,16 @@ async def show_book_detail(callback: CallbackQuery):
                     raise ValueError("No photo available")
             except:
                 # Если фото не загрузилось, показываем без фото
-                await callback.message.edit_text(
+                await safe_edit_message(
+                    callback.message,
                     text,
-                    reply_markup=book_card_keyboard(book, user_id, is_admin),
-                    parse_mode="HTML"
+                    reply_markup=book_card_keyboard(book, user_id, is_admin)
                 )
         else:
-            await callback.message.edit_text(
+            await safe_edit_message(
+                callback.message,
                 text,
-                reply_markup=book_card_keyboard(book, user_id, is_admin),
-                parse_mode="HTML"
+                reply_markup=book_card_keyboard(book, user_id, is_admin)
             )
 
         await callback.answer()
@@ -314,10 +331,10 @@ async def start_search(event: Message | CallbackQuery, state: FSMContext):
     )
 
     if isinstance(event, CallbackQuery):
-        await event.message.edit_text(
+        await safe_edit_message(
+            event.message,
             text,
-            reply_markup=cancel_keyboard(),
-            parse_mode="HTML"
+            reply_markup=cancel_keyboard()
         )
         await event.answer()
     else:

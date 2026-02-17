@@ -59,10 +59,10 @@ async def show_my_books(event: Message | CallbackQuery, state: FSMContext):
         
         builder = InlineKeyboardBuilder()
         
-        # Группируем книги
-        owned = [b for b in books if b.get("owner_id") == user_id]
-        borrowed = [b for b in books if b.get("borrower_id") == user_id]
-        
+        # Группируем книги по tg_id (не по внутреннему DB id!)
+        owned = [b for b in books if b.get("owner_tg_id") == user_id]
+        borrowed = [b for b in books if b.get("borrower_tg_id") == user_id]
+
         if owned:
             for book in owned[:5]:  # Ограничиваем до 5 для красоты
                 status_emoji = {"available": "🟢", "reserved": "🟡", "borrowed": "🔴", "overdue": "⏳"}
@@ -73,7 +73,7 @@ async def show_my_books(event: Message | CallbackQuery, state: FSMContext):
                         callback_data=f"book:{book['id']}"
                     )
                 )
-        
+
         if borrowed:
             for book in borrowed[:5]:
                 builder.row(
@@ -82,11 +82,11 @@ async def show_my_books(event: Message | CallbackQuery, state: FSMContext):
                         callback_data=f"book:{book['id']}"
                     )
                 )
-        
+
         builder.row(
             InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_menu")
         )
-        
+
         if isinstance(event, CallbackQuery):
             await event.message.edit_text(
                 text,
@@ -100,7 +100,7 @@ async def show_my_books(event: Message | CallbackQuery, state: FSMContext):
                 reply_markup=builder.as_markup(),
                 parse_mode="HTML"
             )
-        
+
     except Exception as e:
         text = "❌ Ошибка загрузки книг"
         if isinstance(event, CallbackQuery):
@@ -116,37 +116,58 @@ async def show_book_history(callback: CallbackQuery):
     Показать историю книги (ТЗ 4.4)
     """
     book_id = int(callback.data.split(":")[1])
-    
+
     try:
         # Получаем историю
         history = await api.get_book_history(book_id)
-        
+
         if not history:
             await callback.answer("История пуста", show_alert=True)
             return
-        
+
         # Форматируем историю
         text = format_history(history)
-        
+
         # Кнопка назад к книге
         from aiogram.utils.keyboard import InlineKeyboardBuilder
         from aiogram.types import InlineKeyboardButton
-        
+
         builder = InlineKeyboardBuilder()
         builder.row(
             InlineKeyboardButton(text="🔙 К книге", callback_data=f"book:{book_id}")
         )
-        
-        await callback.message.edit_text(
+
+        await safe_edit_message(
+            callback.message,
             text,
-            reply_markup=builder.as_markup(),
-            parse_mode="HTML"
+            reply_markup=builder.as_markup()
         )
         await callback.answer()
-        
+
     except Exception as e:
         await callback.answer("Ошибка загрузки истории", show_alert=True)
         print(f"Error loading history: {e}")
+
+
+async def safe_edit_message(message, text: str, reply_markup=None, parse_mode="HTML"):
+    """
+    Универсальное редактирование сообщения.
+    Карточки книг с фото — это photo-сообщения без текста.
+    edit_text() на них падает с "there is no text in the message to edit".
+    Решение: для фото используем edit_caption(), для текста — edit_text().
+    """
+    if message.photo or message.document or message.sticker:
+        await message.edit_caption(
+            caption=text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode
+        )
+    else:
+        await message.edit_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode
+        )
 
 
 @router.callback_query(F.data.startswith("delete:"))
@@ -156,19 +177,19 @@ async def confirm_delete_book(callback: CallbackQuery):
     """
     book_id = int(callback.data.split(":")[1])
     user_id = callback.from_user.id
-    
+
     try:
         book = await api.get_book(book_id)
-        
+
         if not book:
             await callback.answer("Книга не найдена", show_alert=True)
             return
-        
-        # Проверка прав
-        if book.get("owner_id") != user_id:
+
+        # Проверка прав — сравниваем Telegram ID, не DB id
+        if book.get("owner_tg_id") != user_id:
             await callback.answer("Только владелец может удалить книгу", show_alert=True)
             return
-        
+
         # Проверка статуса
         if book.get("status") in ["borrowed", "reserved"]:
             await callback.answer(
@@ -176,11 +197,10 @@ async def confirm_delete_book(callback: CallbackQuery):
                 show_alert=True
             )
             return
-        
-        # Запрашиваем подтверждение
+
         from aiogram.utils.keyboard import InlineKeyboardBuilder
         from aiogram.types import InlineKeyboardButton
-        
+
         builder = InlineKeyboardBuilder()
         builder.row(
             InlineKeyboardButton(
@@ -192,18 +212,22 @@ async def confirm_delete_book(callback: CallbackQuery):
                 callback_data=f"book:{book_id}"
             )
         )
-        
-        await callback.message.edit_text(
+
+        confirm_text = (
             f"❓ <b>Подтверждение удаления</b>\n\n"
             f"Вы уверены, что хотите удалить книгу?\n\n"
             f"📖 {book['title']}\n"
             f"✍️ {book['author']}\n\n"
-            f"⚠️ Это действие нельзя отменить!",
-            reply_markup=builder.as_markup(),
-            parse_mode="HTML"
+            f"⚠️ Это действие нельзя отменить!"
+        )
+
+        await safe_edit_message(
+            callback.message,
+            confirm_text,
+            reply_markup=builder.as_markup()
         )
         await callback.answer()
-        
+
     except Exception as e:
         await callback.answer("Ошибка", show_alert=True)
         print(f"Error in confirm_delete: {e}")
@@ -216,17 +240,17 @@ async def delete_book(callback: CallbackQuery):
     """
     book_id = int(callback.data.split(":")[1])
     user_id = callback.from_user.id
-    
+
     try:
         await api.delete_book(book_id, user_id)
-        
-        await callback.message.edit_text(
+
+        await safe_edit_message(
+            callback.message,
             "✅ <b>Книга удалена</b>\n\n"
-            "Книга перемещена в архив и больше не отображается в каталоге.",
-            parse_mode="HTML"
+            "Книга перемещена в архив и больше не отображается в каталоге."
         )
         await callback.answer("Удалено", show_alert=True)
-        
+
     except Exception as e:
         await callback.answer("Ошибка удаления", show_alert=True)
         print(f"Error deleting book: {e}")

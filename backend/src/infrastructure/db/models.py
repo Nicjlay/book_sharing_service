@@ -9,11 +9,21 @@ Base = declarative_base()
 class UserTable(Base):
     __tablename__ = "users"
 
-    id = Column(BigInteger, primary_key=True, index=True)  # Telegram ID
+    id = Column(BigInteger, primary_key=True, index=True)  # Telegram ID (используется как PK)
     full_name = Column(String, nullable=False)
-    username = Column(String, nullable=True, index=True)  # Индекс для поиска
-    is_admin = Column(Boolean, default=False, index=True)  # Индекс для фильтрации админов
+    username = Column(String, nullable=True, index=True)
+    is_admin = Column(Boolean, default=False, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+    @property
+    def tg_id(self) -> int:
+        """
+        Telegram ID пользователя.
+        В данной схеме id и есть tg_id — хранится как первичный ключ.
+        Свойство добавлено для единообразия кода: book.owner.tg_id
+        работает везде без AttributeError.
+        """
+        return self.id
 
 
 class BookTable(Base):

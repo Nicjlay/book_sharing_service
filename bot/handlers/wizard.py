@@ -430,10 +430,11 @@ async def confirm_and_create_book(callback: CallbackQuery, state: FSMContext):
             f"🔖 ID: #{book.get('id', '???')}"
         )
 
+        is_admin = callback.from_user.id in settings.admin_ids_list
         await callback.message.answer(
             result_text,
             parse_mode="HTML",
-            reply_markup=main_menu_keyboard()
+            reply_markup=main_menu_keyboard(is_admin)
         )
 
     except Exception as e:

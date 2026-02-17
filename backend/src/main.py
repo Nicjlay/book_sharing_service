@@ -37,7 +37,7 @@ BOOKS_MEDIA_DIR = MEDIA_ROOT / "books"
 BOOKS_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
 # 3. Путь к заглушке (физический)
-DEFAULT_IMAGE_PATH = BOOKS_MEDIA_DIR / "cover.jpg"
+DEFAULT_IMAGE_PATH = BOOKS_MEDIA_DIR / "base_cover.jpg"
 
 # Простая проверка: если заглушки нет, можно положить туда пустой файл
 # или вывести предупреждение в логи при старте
@@ -122,6 +122,7 @@ async def list_books(
         if book.owner:
             dto.owner_username = book.owner.username
             dto.owner_full_name = book.owner.full_name
+            dto.owner_tg_id = book.owner.tg_id
         results.append(dto)
     return results
 
@@ -137,6 +138,11 @@ async def get_book_detail(book_id: int, db: AsyncSession = Depends(get_db)):
     if book.owner:
         dto.owner_username = book.owner.username
         dto.owner_full_name = book.owner.full_name
+        dto.owner_tg_id = book.owner.tg_id
+    if book.borrower:
+        dto.borrower_username = book.borrower.username
+        dto.borrower_full_name = book.borrower.full_name
+        dto.borrower_tg_id = book.borrower.tg_id
     return dto
 
 
@@ -265,9 +271,11 @@ async def get_pending_reservations(db: AsyncSession = Depends(get_db)):
         if book.owner:
             dto.owner_username = book.owner.username
             dto.owner_full_name = book.owner.full_name
+            dto.owner_tg_id = book.owner.tg_id
         if book.borrower:
             dto.borrower_username = book.borrower.username if book.borrower.username else f"ID{book.borrower.id}"
             dto.borrower_full_name = book.borrower.full_name
+            dto.borrower_tg_id = book.borrower.tg_id
         results.append(dto)
     return results
 
