@@ -37,7 +37,7 @@ BOOKS_MEDIA_DIR = MEDIA_ROOT / "books"
 BOOKS_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
 # 3. Путь к заглушке (физический)
-DEFAULT_IMAGE_PATH = BOOKS_MEDIA_DIR / "base_cover.jpg"
+DEFAULT_IMAGE_PATH = BOOKS_MEDIA_DIR / "cover.jpg"
 
 # Простая проверка: если заглушки нет, можно положить туда пустой файл
 # или вывести предупреждение в логи при старте
