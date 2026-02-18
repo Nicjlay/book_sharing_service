@@ -5,7 +5,8 @@ from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from typing import Optional, Dict
 from aiogram import Bot
-from aiogram.types import BufferedInputFile
+from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from config import settings
 from utils.formatters import format_notification
 import httpx
@@ -46,11 +47,21 @@ async def _fetch_photo(photo_path: str) -> Optional[bytes]:
     return None
 
 
+def _make_reservation_keyboard(book_id: int) -> InlineKeyboardMarkup:
+    """Кнопки быстрого действия для уведомления о заявке на бронирование"""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="✅ Выдать книгу", callback_data=f"approve:{book_id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{book_id}")
+    )
+    return builder.as_markup()
+
+
 async def _send_to_user(user_id: int, text: str, photo_bytes: Optional[bytes] = None,
-                         photo_path: str = None):
+                         photo_path: str = None, reply_markup=None):
     """Отправляет уведомление пользователю. Если есть фото — шлёт отдельным сообщением."""
-    # Текстовое уведомление
-    await bot.send_message(chat_id=user_id, text=text, parse_mode="HTML")
+    await bot.send_message(chat_id=user_id, text=text, parse_mode="HTML",
+                           reply_markup=reply_markup)
 
     # Фото — отдельным сообщением после текста
     if not photo_bytes and photo_path:
@@ -86,11 +97,17 @@ async def receive_notification(
         # Фото из meta (только для book_returned)
         photo_path = payload.meta.get("photo_path") if payload.meta else None
 
+        # Кнопки быстрого действия для заявок на бронирование
+        keyboard = None
+        if payload.type == "admin_reservation_request" and payload.book_id:
+            keyboard = _make_reservation_keyboard(payload.book_id)
+
         if payload.user_id == -1:
             # Всем админам
             for admin_id in settings.admin_ids_list:
                 try:
-                    await _send_to_user(admin_id, notification_text, photo_path=photo_path)
+                    await _send_to_user(admin_id, notification_text, photo_path=photo_path,
+                                        reply_markup=keyboard)
                 except Exception as e:
                     print(f"Failed to send to admin {admin_id}: {e}")
 
@@ -99,14 +116,15 @@ async def receive_notification(
             if settings.group_chat_id:
                 try:
                     await _send_to_user(settings.group_chat_id, notification_text,
-                                        photo_path=photo_path)
+                                        photo_path=photo_path, reply_markup=keyboard)
                 except Exception as e:
                     print(f"Failed to send to group: {e}")
 
         else:
             # Конкретному пользователю
             try:
-                await _send_to_user(payload.user_id, notification_text, photo_path=photo_path)
+                await _send_to_user(payload.user_id, notification_text, photo_path=photo_path,
+                                    reply_markup=keyboard)
             except Exception as e:
                 print(f"Failed to send to user {payload.user_id}: {e}")
 
