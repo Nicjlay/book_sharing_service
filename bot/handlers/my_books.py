@@ -258,11 +258,17 @@ async def delete_book(callback: CallbackQuery):
     user_id = callback.from_user.id
     try:
         await api.delete_book(book_id, user_id)
-        await safe_edit_message(
-            callback.message,
-            "✅ <b>Книга удалена</b>\n\nКнига перемещена в архив."
+        is_admin = user_id in settings.admin_ids_list
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await callback.message.answer(
+            "✅ <b>Книга удалена</b>\n\nКнига перемещена в архив.",
+            reply_markup=main_menu_keyboard(is_admin),
+            parse_mode="HTML"
         )
-        await callback.answer("Удалено", show_alert=True)
+        await callback.answer("Удалено")
     except Exception as e:
         await callback.answer("Ошибка удаления", show_alert=True)
         print(f"Error deleting book: {e}")
