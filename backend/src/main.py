@@ -20,6 +20,7 @@ from domain.schemas import (
     NotificationPayload, UserAuthRequest
 )
 from domain.domain_models import BookStatus
+from infrastructure.services.fuzzy_search import search_books as fuzzy_search_books
 
 dotenv_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path)
@@ -111,20 +112,50 @@ async def list_books(
 
     if user_id:
         books = await repo.get_my_books(user_id)
+        results = []
+        for book in books:
+            dto = BookRead.model_validate(book)
+            if book.owner:
+                dto.owner_username = book.owner.username
+                dto.owner_full_name = book.owner.full_name
+                dto.owner_tg_id = book.owner.tg_id
+            results.append(dto)
+        return results
+
     elif query:
-        books = await repo.search_books(query)
+        # Загружаем ВСЕ не-удалённые книги, затем ранжируем триграммным поиском
+        all_books = await repo.get_books(status=None, genre=None)
+        # Конвертируем ORM → dict для fuzzy_search
+        book_dicts = []
+        orm_map = {}
+        for book in all_books:
+            d = {"id": book.id, "title": book.title, "author": book.author}
+            book_dicts.append(d)
+            orm_map[book.id] = book
+        # Нечёткий поиск возвращает [(dict, score), ...]
+        ranked = fuzzy_search_books(query, book_dicts, threshold=0.20, limit=15)
+        results = []
+        for book_dict, score in ranked:
+            book = orm_map[book_dict["id"]]
+            dto = BookRead.model_validate(book)
+            if book.owner:
+                dto.owner_username = book.owner.username
+                dto.owner_full_name = book.owner.full_name
+                dto.owner_tg_id = book.owner.tg_id
+            results.append(dto)
+        return results
+
     else:
         books = await repo.get_books(status=status, genre=genre)
-
-    results = []
-    for book in books:
-        dto = BookRead.model_validate(book)
-        if book.owner:
-            dto.owner_username = book.owner.username
-            dto.owner_full_name = book.owner.full_name
-            dto.owner_tg_id = book.owner.tg_id
-        results.append(dto)
-    return results
+        results = []
+        for book in books:
+            dto = BookRead.model_validate(book)
+            if book.owner:
+                dto.owner_username = book.owner.username
+                dto.owner_full_name = book.owner.full_name
+                dto.owner_tg_id = book.owner.tg_id
+            results.append(dto)
+        return results
 
 
 @app.get("/books/{book_id}", response_model=BookRead)

@@ -20,7 +20,8 @@ from handlers import (
     wizard,
     reservation,
     admin,
-    my_books
+    my_books,
+    search
 )
 
 # Настройка логирования
@@ -50,6 +51,7 @@ async def main():
     dp.include_router(reservation.router)
     dp.include_router(admin.router)
     dp.include_router(my_books.router)
+    dp.include_router(search.router)
 
     # Устанавливаем бота в webhook модуль
     webhook_module.set_bot(bot)
