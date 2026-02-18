@@ -5,12 +5,13 @@ from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from typing import Optional, Dict
 from aiogram import Bot
+from aiogram.types import BufferedInputFile
 from config import settings
 from utils.formatters import format_notification
+import httpx
 
 app = FastAPI(title="Library Bot Webhook")
 
-# Инициализируем бота (будет установлено в main.py)
 bot: Optional[Bot] = None
 
 
@@ -22,11 +23,49 @@ def set_bot(bot_instance: Bot):
 
 class NotificationPayload(BaseModel):
     """Формат уведомления от API"""
-    user_id: int  # -1 для всех админов, 0 для группы
+    user_id: int        # -1 = всем админам, 0 = в группу
     type: str
     message: str
     book_id: Optional[int] = None
     meta: Dict = {}
+
+
+async def _fetch_photo(photo_path: str) -> Optional[bytes]:
+    """Скачивает фото с API по внутреннему пути"""
+    if not photo_path:
+        return None
+    try:
+        api_url = settings.api_url.rstrip("/")
+        url = f"{api_url}/media/{photo_path}"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url)
+            if resp.status_code == 200:
+                return resp.content
+    except Exception as e:
+        print(f"⚠️ Failed to fetch photo {photo_path}: {e}")
+    return None
+
+
+async def _send_to_user(user_id: int, text: str, photo_bytes: Optional[bytes] = None,
+                         photo_path: str = None):
+    """Отправляет уведомление пользователю. Если есть фото — шлёт отдельным сообщением."""
+    # Текстовое уведомление
+    await bot.send_message(chat_id=user_id, text=text, parse_mode="HTML")
+
+    # Фото — отдельным сообщением после текста
+    if not photo_bytes and photo_path:
+        photo_bytes = await _fetch_photo(photo_path)
+
+    if photo_bytes:
+        try:
+            photo_file = BufferedInputFile(photo_bytes, filename="photo.jpg")
+            await bot.send_photo(
+                chat_id=user_id,
+                photo=photo_file,
+                caption="📸 Фото книги при возврате"
+            )
+        except Exception as e:
+            print(f"⚠️ Failed to send photo to {user_id}: {e}")
 
 
 @app.post("/webhook")
@@ -34,58 +73,45 @@ async def receive_notification(
     payload: NotificationPayload,
     x_api_token: str = Header(None)
 ):
-    """
-    Прием уведомлений от API (push-архитектура)
-    """
-    # Проверка токена
+    """Прием уведомлений от API (push-архитектура)"""
     if x_api_token != settings.api_token:
         raise HTTPException(status_code=401, detail="Invalid API token")
-    
+
     if not bot:
         raise HTTPException(status_code=500, detail="Bot not initialized")
-    
+
     try:
-        # Форматируем уведомление
         notification_text = format_notification(payload.model_dump())
-        
-        # Определяем получателей
+
+        # Фото из meta (только для book_returned)
+        photo_path = payload.meta.get("photo_path") if payload.meta else None
+
         if payload.user_id == -1:
-            # Отправляем всем админам
+            # Всем админам
             for admin_id in settings.admin_ids_list:
                 try:
-                    await bot.send_message(
-                        chat_id=admin_id,
-                        text=notification_text,
-                        parse_mode="HTML"
-                    )
+                    await _send_to_user(admin_id, notification_text, photo_path=photo_path)
                 except Exception as e:
                     print(f"Failed to send to admin {admin_id}: {e}")
-        
+
         elif payload.user_id == 0:
-            # Отправляем в группу (если настроена)
+            # В группу
             if settings.group_chat_id:
                 try:
-                    await bot.send_message(
-                        chat_id=settings.group_chat_id,
-                        text=notification_text,
-                        parse_mode="HTML"
-                    )
+                    await _send_to_user(settings.group_chat_id, notification_text,
+                                        photo_path=photo_path)
                 except Exception as e:
                     print(f"Failed to send to group: {e}")
-        
+
         else:
-            # Отправляем конкретному пользователю
+            # Конкретному пользователю
             try:
-                await bot.send_message(
-                    chat_id=payload.user_id,
-                    text=notification_text,
-                    parse_mode="HTML"
-                )
+                await _send_to_user(payload.user_id, notification_text, photo_path=photo_path)
             except Exception as e:
                 print(f"Failed to send to user {payload.user_id}: {e}")
-        
+
         return {"status": "ok"}
-    
+
     except Exception as e:
         print(f"Error processing notification: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -93,8 +119,4 @@ async def receive_notification(
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "ok",
-        "bot_initialized": bot is not None
-    }
+    return {"status": "ok", "bot_initialized": bot is not None}

@@ -3,6 +3,7 @@ aiogram==3.4.1
 
 # HTTP Client для API
 aiohttp==3.9.1
+httpx==0.28.1
 
 # Environment Variables
 python-dotenv==1.0.0

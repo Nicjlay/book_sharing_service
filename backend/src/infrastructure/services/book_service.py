@@ -116,8 +116,14 @@ class LibraryService:
         )
 
         # Отправляем уведомление админу о новой заявке (ТЗ 3.2.3)
+        # Пытаемся получить username пользователя для уведомления
         try:
-            await notification_service.notify_admin_about_reservation(book, user_id, days)
+            requester = await self.user_repo.get_by_id(user_id)
+            requester_username = requester.username if requester else None
+        except Exception:
+            requester_username = None
+        try:
+            await notification_service.notify_admin_about_reservation(book, user_id, days, requester_username)
         except Exception as e:
             print(f"⚠️ notify_admin_about_reservation failed (non-fatal): {e}")
 
@@ -201,7 +207,12 @@ class LibraryService:
         # Если вернул не владелец, уведомляем его
         if not is_owner and book.owner_id:
             try:
-                await notification_service.notify_owner_about_return(book, user_id, photo_path)
+                returner = await self.user_repo.get_by_id(user_id)
+                returner_username = returner.username if returner else None
+            except Exception:
+                returner_username = None
+            try:
+                await notification_service.notify_owner_about_return(book, user_id, photo_path, returner_username)
             except Exception as e:
                 print(f"⚠️ notify_owner_about_return failed (non-fatal): {e}")
 
