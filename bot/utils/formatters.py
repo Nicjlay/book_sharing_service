@@ -83,7 +83,15 @@ def format_history(history: List[Dict]) -> str:
     """Форматирование истории книги с кликабельными именами читателей"""
     if not history:
         return "📜 История пуста"
+
+    LIMIT = 30
+    truncated = len(history) > LIMIT
+    history = history[-LIMIT:]  # берём последние 30
+
     text = "📜 <b>История книги:</b>\n\n"
+    if truncated:
+        text += f"<i>(показаны последние {LIMIT} записей)</i>\n\n"
+
     for entry in history:
         raw_date = entry.get("created_at") or entry.get("date") or entry.get("timestamp")
         if raw_date:

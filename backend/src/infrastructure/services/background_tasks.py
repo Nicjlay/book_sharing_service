@@ -4,17 +4,17 @@ Background tasks и Push-уведомления через HTTP webhook (Push Ar
 import asyncio
 import httpx
 from datetime import datetime, timedelta
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 
 from domain.domain_models import BookStatus, NotificationType
-from infrastructure.db.models import BookTable
+from infrastructure.db.tables import BookTable
 import os
 
-BOT_WEBHOOK_URL = os.getenv("BOT_WEBHOOK_URL")
-API_TOKEN = os.getenv("API_TOKEN")
+BOT_WEBHOOK_URL = os.getenv("BOT_WEBHOOK_URL", "http://library_bot:8001/webhook")
+API_TOKEN = os.getenv("API_TOKEN", "")
 
 
 class NotificationService:
@@ -246,20 +246,27 @@ class OverdueChecker:
                 await notification_service.notify_about_overdue(book)
                 print(f"⚠️ Book #{book.id} marked as OVERDUE")
 
-            # 2. Напоминания за 3 дня до срока
-            reminder_window = now + timedelta(days=3)
-            result2 = await session.execute(
-                select(BookTable).where(
-                    BookTable.status == BookStatus.BORROWED,
-                    BookTable.return_due_date <= reminder_window,
-                    BookTable.return_due_date > now
-                )
-            )
-            reminder_books = result2.scalars().all()
+            # 2. Напоминания за 3 дня и за 1 день до срока.
+            # Чтобы не спамить каждый час — проверяем только узкое окно ±30 минут
+            # вокруг точных порогов. За цикл в 1 час окно гарантированно попадёт.
+            for days_threshold in (3, 1):
+                window_start = now + timedelta(days=days_threshold) - timedelta(minutes=30)
+                window_end   = now + timedelta(days=days_threshold) + timedelta(minutes=30)
 
-            for book in reminder_books:
-                days_left = (book.return_due_date - now).days + 1
-                await notification_service.notify_borrower_about_due_date(book, days_left)
+                result2 = await session.execute(
+                    select(BookTable).where(
+                        BookTable.status == BookStatus.BORROWED,
+                        BookTable.return_due_date >= window_start,
+                        BookTable.return_due_date <= window_end,
+                    )
+                )
+                reminder_books = result2.scalars().all()
+
+                for book in reminder_books:
+                    # Точное число дней через total_seconds чтобы не показывать 0
+                    delta = book.return_due_date - now
+                    days_left = max(1, int(delta.total_seconds() / 86400) + 1)
+                    await notification_service.notify_borrower_about_due_date(book, days_left)
 
             await session.commit()
 
