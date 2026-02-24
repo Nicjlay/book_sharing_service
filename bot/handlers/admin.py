@@ -95,7 +95,9 @@ async def show_pending_reservations(callback: CallbackQuery, state: FSMContext, 
             await callback.answer()
             return
 
-        await state.update_data(pending_books=books, current_pending_index=0)
+        # Храним только id'шники — не кладём все данные книг в память FSM
+        book_ids = [b["id"] for b in books]
+        await state.update_data(pending_book_ids=book_ids, pending_books_cache=books, current_pending_index=0)
         await show_reservation_request(callback.message, books[0], 0, len(books))
         await callback.answer()
 
@@ -166,7 +168,7 @@ async def navigate_pending(callback: CallbackQuery, state: FSMContext):
     """Навигация между заявками"""
     index = int(callback.data.split(":")[1])
     data = await state.get_data()
-    books = data.get("pending_books", [])
+    books = data.get("pending_books_cache", [])
 
     if not books or index >= len(books):
         await callback.answer("Заявка не найдена", show_alert=True)

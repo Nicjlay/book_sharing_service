@@ -31,6 +31,17 @@ class NotificationPayload(BaseModel):
     meta: Dict = {}
 
 
+# Singleton HTTP client — один SSL context на весь процесс
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=10.0)
+    return _http_client
+
+
 async def _fetch_photo(photo_path: str) -> Optional[bytes]:
     """Скачивает фото с API по внутреннему пути"""
     if not photo_path:
@@ -38,10 +49,10 @@ async def _fetch_photo(photo_path: str) -> Optional[bytes]:
     try:
         api_url = settings.api_url.rstrip("/")
         url = f"{api_url}/media/{photo_path}"
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url)
-            if resp.status_code == 200:
-                return resp.content
+        client = _get_http_client()
+        resp = await client.get(url)
+        if resp.status_code == 200:
+            return resp.content
     except Exception as e:
         print(f"⚠️ Failed to fetch photo {photo_path}: {e}")
     return None
@@ -138,3 +149,12 @@ async def receive_notification(
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "bot_initialized": bot is not None}
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Закрываем HTTP клиент при остановке — освобождаем SSL context."""
+    global _http_client
+    if _http_client and not _http_client.is_closed:
+        await _http_client.aclose()
+        print("🛑 Webhook HTTP client closed")

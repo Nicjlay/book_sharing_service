@@ -3,15 +3,14 @@ Background tasks и Push-уведомления через HTTP webhook (Push Ar
 """
 import asyncio
 import httpx
+import os
 from datetime import datetime, timedelta
-from typing import Any, Dict, List
-
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
+# Fix #4: Optional отсутствовал в imports — TypeError при создании NotificationService
+from typing import Any, Dict, List, Optional
 
 from domain.domain_models import BookStatus, NotificationType
-from infrastructure.db.tables import BookTable
-import os
+# Fix #3: был неверный путь infrastructure.db.tables — такого модуля не существует
+from infrastructure.db.models import BookTable
 
 BOT_WEBHOOK_URL = os.getenv("BOT_WEBHOOK_URL", "http://library_bot:8001/webhook")
 API_TOKEN = os.getenv("API_TOKEN", "")
@@ -21,36 +20,34 @@ class NotificationService:
     """Сервис push-уведомлений: отправляет HTTP POST на бот"""
 
     def __init__(self):
-        self.notifications_queue: list[Dict[str, Any]] = []
-        self._max_queue_size = 200
+        # Единственный httpx клиент на весь процесс — создаётся один SSL context
+        self._http_client: Optional[httpx.AsyncClient] = None
 
-    def _enqueue(self, payload: Dict[str, Any]):
-        self.notifications_queue.append({**payload, "_sent_at": datetime.now().isoformat()})
-        if len(self.notifications_queue) > self._max_queue_size:
-            self.notifications_queue = self.notifications_queue[-self._max_queue_size:]
+    async def _get_http_client(self) -> httpx.AsyncClient:
+        """Ленивая инициализация — переиспользуем один клиент."""
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(timeout=5.0)
+        return self._http_client
 
-    def get_notifications(self, user_id: int) -> list[Dict[str, Any]]:
-        return [n for n in self.notifications_queue if n.get("user_id") == user_id]
-
-    def clear_notifications(self, user_id: int):
-        self.notifications_queue = [n for n in self.notifications_queue if n.get("user_id") != user_id]
+    async def close(self):
+        """Закрыть клиент при shutdown (вызывается в lifespan)."""
+        if self._http_client and not self._http_client.is_closed:
+            await self._http_client.aclose()
 
     async def _send_http_notification(self, payload: Dict[str, Any]):
         """Отправка уведомления в бот через HTTP"""
-        # Конвертируем enum в строку если нужно
         if hasattr(payload.get("type"), "value"):
             payload["type"] = payload["type"].value
 
-        self._enqueue(payload)
         print(f"📡 PUSH to Bot {payload.get('user_id')}: {payload.get('type')}")
 
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post(
-                    BOT_WEBHOOK_URL,
-                    json=payload,
-                    headers={"X-API-Token": API_TOKEN}
-                )
+            client = await self._get_http_client()
+            await client.post(
+                BOT_WEBHOOK_URL,
+                json=payload,
+                headers={"X-API-Token": API_TOKEN}
+            )
         except Exception as e:
             print(f"❌ Bot is not reachable at {BOT_WEBHOOK_URL}: {e}")
 
@@ -71,10 +68,9 @@ class NotificationService:
         await self._send_http_notification(payload)
 
     async def notify_owner_about_return(self, book: BookTable, returner_id: int,
-                                         photo_path: str = None,
-                                         returner_username: str = None):
+                                        photo_path: str = None,
+                                        returner_username: str = None):
         """Уведомление владельцу о возврате книги (ТЗ 3.3.3)"""
-        # Формируем упоминание читателя
         if returner_username:
             reader_mention = f"<a href=\"tg://user?id={returner_id}\">@{returner_username}</a>"
         else:
@@ -85,7 +81,7 @@ class NotificationService:
             msg += "\n📸 Приложено фото состояния книги."
 
         payload = {
-            "user_id": book.owner_id,  # users.id = Telegram ID
+            "user_id": book.owner_id,
             "type": NotificationType.BOOK_RETURNED.value,
             "message": msg,
             "book_id": book.id,
@@ -110,13 +106,24 @@ class NotificationService:
         }
         await self._send_http_notification(payload)
 
-    async def notify_reservation_approved(self, book: BookTable, borrower_username: str = None):
-        """Уведомление о подтверждении брони админом (ТЗ 3.2.3)"""
-        date_str = book.return_due_date.strftime("%d.%m.%Y")
+    async def notify_reservation_approved(self, book: BookTable):
+        """
+        Уведомление о подтверждении брони админом (ТЗ 3.2.3).
+
+        ВАЖНО: этот метод должен вызываться с актуальным объектом book,
+        полученным из БД ПОСЛЕ update_status — иначе return_due_date будет None.
+        """
+        if book.return_due_date is None:
+            # Защитная проверка: если дата всё же None — не крашимся, только логируем
+            print(f"⚠️ notify_reservation_approved: book #{book.id} has no return_due_date, skipping date in message")
+            date_str = "не указана"
+        else:
+            date_str = book.return_due_date.strftime("%d.%m.%Y")
+
         msg = (f"✅ Ваша заявка на книгу <b>«{book.title}»</b> одобрена!\n"
                f"📅 Вернуть до: <b>{date_str}</b>")
         payload = {
-            "user_id": book.borrower_id,  # users.id = Telegram ID
+            "user_id": book.borrower_id,
             "type": NotificationType.RESERVATION_APPROVED.value,
             "message": msg,
             "book_id": book.id,
@@ -183,7 +190,7 @@ class NotificationService:
         await self._send_http_notification(payload)
 
     async def notify_admin_about_reservation(self, book: BookTable, user_id: int, days: int,
-                                              requester_username: str = None):
+                                             requester_username: str = None):
         """Уведомление админу о новой заявке (ТЗ 3.2.3)"""
         if requester_username:
             user_mention = f"<a href=\"tg://user?id={user_id}\">@{requester_username}</a>"
@@ -217,13 +224,15 @@ class OverdueChecker:
     """Фоновая задача для проверки просроченных книг (ТЗ 4.2)"""
 
     def __init__(self):
-        db_url = os.getenv("DATABASE_URL", "").replace("postgresql://", "postgresql+asyncpg://")
-        self.engine = create_async_engine(db_url)
-        self.SessionLocal = sessionmaker(self.engine, class_=AsyncSession, expire_on_commit=False)
+        # Fix #9: раньше создавался второй независимый connection pool к БД,
+        # несмотря на комментарий «переиспользуем engine». Теперь импортируем
+        # SessionLocal из session.py — единственный пул на всё приложение.
+        from infrastructure.db.session import AsyncSessionLocal
+        self.SessionLocal = AsyncSessionLocal
 
     async def check_overdue(self):
         from sqlalchemy import select
-        from infrastructure.db.tables import BookTable
+        from infrastructure.db.models import BookTable
 
         async with self.SessionLocal() as session:
             now = datetime.now()
@@ -251,7 +260,7 @@ class OverdueChecker:
             # вокруг точных порогов. За цикл в 1 час окно гарантированно попадёт.
             for days_threshold in (3, 1):
                 window_start = now + timedelta(days=days_threshold) - timedelta(minutes=30)
-                window_end   = now + timedelta(days=days_threshold) + timedelta(minutes=30)
+                window_end = now + timedelta(days=days_threshold) + timedelta(minutes=30)
 
                 result2 = await session.execute(
                     select(BookTable).where(
@@ -263,7 +272,6 @@ class OverdueChecker:
                 reminder_books = result2.scalars().all()
 
                 for book in reminder_books:
-                    # Точное число дней через total_seconds чтобы не показывать 0
                     delta = book.return_due_date - now
                     days_left = max(1, int(delta.total_seconds() / 86400) + 1)
                     await notification_service.notify_borrower_about_due_date(book, days_left)
@@ -276,10 +284,15 @@ async def run_background_tasks():
     checker = OverdueChecker()
     print(f"🚀 Background tasks started (Push Mode to {BOT_WEBHOOK_URL})...")
 
-    while True:
-        try:
-            await checker.check_overdue()
-        except Exception as e:
-            print(f"❌ Background task error: {e}")
-
-        await asyncio.sleep(3600)  # каждый час
+    try:
+        while True:
+            try:
+                await checker.check_overdue()
+            except Exception as e:
+                print(f"❌ Background task error: {e}")
+            await asyncio.sleep(3600)  # каждый час
+    finally:
+        # Fix #9: не вызываем checker.engine.dispose() — движок теперь общий,
+        # его закроет lifespan в main.py при штатном завершении приложения.
+        await notification_service.close()
+        print("🛑 Background tasks stopped, resources released")

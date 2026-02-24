@@ -16,8 +16,6 @@ class BookBase(BaseModel):
 
     @validator('author')
     def validate_author(cls, v):
-        # Валидация на стороне сервера (страховка).
-        # Основную проверку UI делает бот, но БД не должна принимать мусор.
         parts = v.strip().split()
         if len(parts) < 2:
             raise ValueError("Введите полное имя и фамилию автора")
@@ -60,10 +58,13 @@ class BookRead(BookBase):
     # Дополнительные поля для UI (заполняются в эндпоинтах)
     owner_username: Optional[str] = None
     owner_full_name: Optional[str] = None
-    owner_tg_id: Optional[int] = None      # Telegram ID владельца — для проверки прав в боте
+    # Fix #18: owner_tg_id == owner_id (users.id и есть Telegram ID).
+    # Поле сохранено для обратной совместимости с ботом, но теперь явно
+    # документировано как алиас owner_id.
+    owner_tg_id: Optional[int] = None
     borrower_username: Optional[str] = None
     borrower_full_name: Optional[str] = None
-    borrower_tg_id: Optional[int] = None   # Telegram ID заёмщика — для проверки прав возврата
+    borrower_tg_id: Optional[int] = None
 
     class Config:
         from_attributes = True
@@ -71,8 +72,11 @@ class BookRead(BookBase):
 
 # --- Пользователи ---
 class UserRead(BaseModel):
+    # Fix #18: UserTable.id и есть Telegram ID (BigInteger PK).
+    # Раньше в схеме было два поля — id и tg_id — с одинаковым значением,
+    # что вводило потребителей API в заблуждение. Оставляем только id.
+    # Клиентский код (бот) должен использовать поле id как Telegram ID.
     id: int
-    tg_id: int          # Telegram ID — нужен боту для сравнения владельца
     full_name: str
     username: Optional[str] = None
     is_admin: bool
@@ -80,11 +84,13 @@ class UserRead(BaseModel):
     class Config:
         from_attributes = True
 
+
 class UserAuthRequest(BaseModel):
     tg_id: int
     full_name: str
     username: Optional[str] = None
     is_admin: bool = False
+
 
 # --- Жанры ---
 class GenreList(BaseModel):
@@ -108,7 +114,7 @@ class BookHistoryRead(BaseModel):
 # --- Запросы действий ---
 class ReservationRequest(BaseModel):
     user_id: int
-    days: int = 14  # Дефолт: 2 недели
+    days: int = 14
 
 
 class ApproveRequest(BaseModel):

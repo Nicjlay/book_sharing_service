@@ -19,7 +19,6 @@ class UserRepository:
             user = UserTable(id=tg_id, full_name=full_name, username=username, is_admin=is_admin)
             self.session.add(user)
         else:
-            # Обновляем данные, если они изменились (включая статус админа из конфига бота)
             user.full_name = full_name
             user.username = username
             user.is_admin = is_admin
@@ -32,22 +31,19 @@ class UserRepository:
         return await self.session.get(UserTable, user_id)
 
     async def search_users(self, query_str: str = None) -> List[UserTable]:
-        """Поиск пользователей для Шага 5 визарда (выбор владельца книги)"""
         stmt = select(UserTable)
         if query_str:
-            # Ищем по username или full_name
             stmt = stmt.where(
                 or_(
                     UserTable.username.ilike(f"%{query_str}%"),
                     UserTable.full_name.ilike(f"%{query_str}%")
                 )
             )
-        stmt = stmt.order_by(UserTable.full_name).limit(50)  # Ограничиваем выдачу
+        stmt = stmt.order_by(UserTable.full_name).limit(50)
         result = await self.session.execute(stmt)
         return result.scalars().all()
 
     async def get_all_admins(self) -> List[UserTable]:
-        """Получить всех админов для рассылки уведомлений"""
         stmt = select(UserTable).where(UserTable.is_admin == True)
         result = await self.session.execute(stmt)
         return result.scalars().all()
@@ -74,7 +70,6 @@ class BookRepository:
         return new_book
 
     async def get_book_by_id(self, book_id: int) -> Optional[BookTable]:
-        """Получить книгу с загруженными owner и borrower"""
         query = (
             select(BookTable)
             .options(
@@ -100,7 +95,8 @@ class BookRepository:
         await self.session.execute(stmt)
         await self.session.commit()
 
-    async def update_status(self, book_id: int, status: BookStatus, borrower_id: int = None, due_date: datetime = None):
+    async def update_status(self, book_id: int, status: BookStatus,
+                            borrower_id: int = None, due_date: datetime = None):
         values = {"status": status}
 
         if status == BookStatus.AVAILABLE:
@@ -116,8 +112,32 @@ class BookRepository:
         await self.session.execute(stmt)
         await self.session.commit()
 
-    async def get_books(self, status: Optional[BookStatus] = None, genre: Optional[str] = None) -> List[BookTable]:
-        """Метод для получения книг с фильтрацией (в т.ч. для админской очереди)"""
+    # Fix #5: Атомарная резервация через UPDATE...WHERE status=available...RETURNING.
+    # Гарантирует, что только один из конкурентных запросов успешно «захватит» книгу,
+    # даже если несколько пользователей нажали «Забронировать» одновременно.
+    async def try_reserve(self, book_id: int, user_id: int) -> bool:
+        """
+        Атомарно переводит книгу из AVAILABLE → RESERVED для конкретного пользователя.
+        Возвращает True, если бронирование прошло успешно, False — если книга уже занята.
+        """
+        stmt = (
+            update(BookTable)
+            .where(
+                BookTable.id == book_id,
+                BookTable.status == BookStatus.AVAILABLE,
+                BookTable.is_deleted == False,
+            )
+            .values(status=BookStatus.RESERVED, borrower_id=user_id)
+            .returning(BookTable.id)
+        )
+        result = await self.session.execute(stmt)
+        await self.session.commit()
+        return result.scalar() is not None
+
+    async def get_books(self, status: Optional[BookStatus] = None,
+                        genre: Optional[str] = None,
+                        limit: int = 50,
+                        offset: int = 0) -> List[BookTable]:
         query = (
             select(BookTable)
             .options(
@@ -132,7 +152,8 @@ class BookRepository:
         if genre:
             query = query.where(BookTable.genre == genre)
 
-        query = query.order_by(desc(BookTable.created_at))
+        # Fix #19: добавлена пагинация чтобы не тянуть весь каталог за раз
+        query = query.order_by(desc(BookTable.created_at)).limit(limit).offset(offset)
         result = await self.session.execute(query)
         return result.scalars().all()
 
@@ -159,7 +180,6 @@ class BookRepository:
         return result.scalars().all()
 
     async def get_my_books(self, user_id: int) -> List[BookTable]:
-        """Получить книги пользователя (владелец или заемщик) для раздела 'Мои книги'"""
         query = (
             select(BookTable)
             .where(
@@ -181,22 +201,17 @@ class BookRepository:
         return result.scalars().all()
 
     async def get_all_genres(self) -> List[str]:
-        """Получить уникальные жанры из БД + добавить базовые (ТЗ Шаг 4 визарда)"""
         query = select(distinct(BookTable.genre)).where(BookTable.genre != None)
         result = await self.session.execute(query)
         genres = [g for g in result.scalars().all() if g]
 
-        # Дефолтные жанры, если БД пустая или чтобы они всегда были в топе
         defaults = ["Роман", "Фантастика", "Non-fiction", "Бизнес", "Психология", "Другое"]
-
-        # Объединяем, сохраняя уникальность
         all_genres = list(dict.fromkeys(defaults + genres))
         return all_genres
 
     # --- History ---
-    async def log_history(self, book_id: int, user_id: int, status_to: BookStatus, comment: str,
-                          photo_path: str = None):
-        """Логирование действий в историю книги (ТЗ 4.4)"""
+    async def log_history(self, book_id: int, user_id: int, status_to: BookStatus,
+                          comment: str, photo_path: str = None):
         entry = BookHistoryTable(
             book_id=book_id,
             user_id=user_id,
@@ -208,7 +223,6 @@ class BookRepository:
         await self.session.commit()
 
     async def get_history(self, book_id: int) -> List[BookHistoryTable]:
-        """Получить историю книги (ТЗ 4.4: кнопка '📜 История')"""
         query = (
             select(BookHistoryTable)
             .where(BookHistoryTable.book_id == book_id)
@@ -219,30 +233,50 @@ class BookRepository:
 
     # --- Waitlist ---
     async def add_to_waitlist(self, book_id: int, user_id: int):
-        """Добавить пользователя в лист ожидания (ТЗ 3.2.2)"""
-        # Проверяем, что пользователь еще не в очереди
-        query = select(WaitlistTable).where(
-            and_(WaitlistTable.book_id == book_id, WaitlistTable.user_id == user_id)
+        """
+        Добавить пользователя в лист ожидания.
+        Уникальность гарантируется на уровне БД (UniqueConstraint в модели),
+        поэтому ручную SELECT-проверку убрали — она всё равно не защищала
+        от конкурентных вставок.
+        """
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        stmt = (
+            pg_insert(WaitlistTable)
+            .values(book_id=book_id, user_id=user_id)
+            .on_conflict_do_nothing(constraint="uq_waitlist_book_user")
         )
-        res = await self.session.execute(query)
-        if not res.scalar_one_or_none():
-            self.session.add(WaitlistTable(book_id=book_id, user_id=user_id))
-            await self.session.commit()
+        await self.session.execute(stmt)
+        await self.session.commit()
 
     async def get_waitlist_users(self, book_id: int) -> List[int]:
-        """Получить список пользователей в ожидании (для уведомлений при возврате)"""
         query = select(WaitlistTable.user_id).where(WaitlistTable.book_id == book_id)
         res = await self.session.execute(query)
         return res.scalars().all()
 
+    # Fix #10: атомарное извлечение очереди через DELETE...RETURNING.
+    # Исключает race condition, при котором пользователь добавлялся в waitlist
+    # между get_waitlist_users и clear_waitlist и не получал уведомление.
+    async def pop_waitlist(self, book_id: int) -> List[int]:
+        """
+        Атомарно извлекает всех ожидающих и удаляет их из очереди одной операцией.
+        Новые записи, добавленные параллельно в момент операции, не теряются —
+        они появятся при следующем возврате книги.
+        """
+        stmt = (
+            delete(WaitlistTable)
+            .where(WaitlistTable.book_id == book_id)
+            .returning(WaitlistTable.user_id)
+        )
+        result = await self.session.execute(stmt)
+        await self.session.commit()
+        return result.scalars().all()
+
     async def clear_waitlist(self, book_id: int):
-        """Очистить лист ожидания после рассылки уведомлений"""
         stmt = delete(WaitlistTable).where(WaitlistTable.book_id == book_id)
         await self.session.execute(stmt)
         await self.session.commit()
 
     async def remove_from_waitlist(self, book_id: int, user_id: int):
-        """Удалить конкретного пользователя из листа ожидания"""
         stmt = delete(WaitlistTable).where(
             and_(WaitlistTable.book_id == book_id, WaitlistTable.user_id == user_id)
         )
