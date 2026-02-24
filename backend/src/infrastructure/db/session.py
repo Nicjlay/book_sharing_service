@@ -9,8 +9,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is required")
 
-# Fix #14: echo=True в продакшне засоряет логи и нагружает I/O.
-# Управляется переменной SQL_ECHO=true в .env (по умолчанию выключен).
+# SQL_ECHO=true в .env включает логирование запросов. В продакшне — выключено.
 _sql_echo = os.getenv("SQL_ECHO", "false").lower() == "true"
 
 engine = create_async_engine(DATABASE_URL, echo=_sql_echo)
