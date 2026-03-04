@@ -1,32 +1,78 @@
 """
 Handlers для бронирования и возврата книг (ТЗ 3.2-3.3)
 """
+import io
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
 from aiogram import Router, F
-from aiogram.types import CallbackQuery, Message
 from aiogram.fsm.context import FSMContext
-from datetime import datetime, timedelta
+from aiogram.types import CallbackQuery, Message
 
-from api.client import api
-from states.wizard import ReservationStates, ReturnBookStates
-from keyboards.inline import (
-    reservation_days_keyboard, return_photo_keyboard,
-    book_card_keyboard, cancel_keyboard, main_menu_keyboard
-)
-from utils.validators import validate_days
-from utils.telegram import safe_edit_message
+from api.client import APIError, api
 from config import settings
+from keyboards.inline import (
+    cancel_keyboard,
+    main_menu_keyboard,
+    reservation_days_keyboard,
+    return_photo_keyboard,
+)
+from states.wizard import ReservationStates, ReturnBookStates
+from utils.formatters import escape_html
+from utils.telegram import safe_delete_message, safe_edit_message
+from utils.validators import validate_days
 
+logger = logging.getLogger(__name__)
 router = Router()
 
 
 async def _go_home(message: Message, user_id: int, text: str):
     """Удаляет текущее сообщение и показывает главное меню с результатом."""
-    is_admin = user_id in settings.admin_ids_list
-    try:
-        await message.delete()
-    except Exception:
-        pass
+    is_admin = user_id in settings.admin_ids_set
+    await safe_delete_message(message)
     await message.answer(text, reply_markup=main_menu_keyboard(is_admin), parse_mode="HTML")
+
+
+def _format_reservation_error(e: APIError) -> str:
+    """
+    Формирует UX-сообщение для API-ошибок бронирования.
+
+    409 может означать как «книга занята», так и «превышен лимит книг».
+    Различаем их по ключевым словам в detail-сообщении API.
+    """
+    if e.status == 409:
+        msg = e.message.lower()
+        _LIMIT_KEYWORDS = (
+            "5 книг", "более 5", "limit", "лимит", "превышен",
+            "максимум", "maximum", "exceed",
+        )
+        if any(kw in msg for kw in _LIMIT_KEYWORDS):
+            return (
+                "❌ <b>Превышен лимит книг</b>\n\n"
+                "Нельзя иметь более 5 книг одновременно.\n"
+                "Верните уже взятые книги."
+            )
+        return (
+            "❌ <b>Книга уже забронирована кем-то другим.</b>\n\n"
+            "Вы можете встать в лист ожидания через каталог."
+        )
+    if e.status == 400:
+        return "❌ Книга недоступна для бронирования."
+    if e.status == 403:
+        return "❌ Нельзя забронировать эту книгу."
+    return "❌ Ошибка бронирования. Попробуйте позже."
+
+
+def _make_success_text(days: int) -> str:
+    """Формирует текст успешного бронирования."""
+    due_date = (datetime.now(timezone.utc) + timedelta(days=days)).strftime("%d.%m.%Y")
+    return (
+        f"✅ <b>Запрос на бронирование отправлен!</b>\n\n"
+        f"📅 Срок: {days} дней (до {due_date})\n\n"
+        f"⏳ Ожидайте подтверждения от администратора.\n"
+        f"Вы получите уведомление, когда заявка будет обработана."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -36,7 +82,12 @@ async def _go_home(message: Message, user_id: int, text: str):
 @router.callback_query(F.data.startswith("reserve:"))
 async def start_reservation(callback: CallbackQuery, state: FSMContext):
     """Начало бронирования книги (ТЗ 3.2.2)"""
-    book_id = int(callback.data.split(":")[1])
+    try:
+        book_id = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный ID книги", show_alert=True)
+        return
+
     user_id = callback.from_user.id
 
     try:
@@ -45,7 +96,11 @@ async def start_reservation(callback: CallbackQuery, state: FSMContext):
             await callback.answer("Книга не найдена", show_alert=True)
             return
 
-        if book["status"] != "available":
+        # FIX: book.get("status") вместо book["status"] — KeyError если поле отсутствует.
+        # TOCTOU-смягчение: проверяем статус для быстрого UX-фидбека.
+        # Окончательную проверку выполняет API при request_reservation.
+        book_status = book.get("status")
+        if book_status != "available":
             await callback.answer("Книга уже занята", show_alert=True)
             return
 
@@ -56,45 +111,52 @@ async def start_reservation(callback: CallbackQuery, state: FSMContext):
         await state.update_data(reserve_book_id=book_id)
         await state.set_state(ReservationStates.select_days)
 
+        safe_title = escape_html(book.get("title", "—"))
+        safe_author = escape_html(book.get("author", "—"))
+
         await safe_edit_message(
             callback.message,
-            f"📖 <b>{book['title']}</b>\n"
-            f"✍️ {book['author']}\n\n"
+            f"📖 <b>{safe_title}</b>\n"
+            f"✍️ {safe_author}\n\n"
             f"📅 <b>Выберите срок бронирования:</b>\n\n"
             f"На какой срок вы хотите взять книгу? (1–90 дней)",
-            reply_markup=reservation_days_keyboard()
+            reply_markup=reservation_days_keyboard(),
         )
         await callback.answer()
 
     except Exception as e:
         await callback.answer("Ошибка бронирования", show_alert=True)
-        print(f"Error in start_reservation: {e}")
+        logger.error("Error in start_reservation (book %d): %s", book_id, e)
 
 
 @router.callback_query(F.data.startswith("days:"), ReservationStates.select_days)
 async def select_reservation_days(callback: CallbackQuery, state: FSMContext):
-    """Выбор срока бронирования (ТЗ 3.2.2)"""
-    days_str = callback.data.split(":")[1]
+    """Выбор срока бронирования"""
+    days_str = callback.data.split(":", 1)[1]
 
     if days_str == "custom":
         await safe_edit_message(
             callback.message,
             "✏️ Введите количество дней (1–90):",
-            reply_markup=cancel_keyboard()
+            reply_markup=cancel_keyboard(),
         )
         await state.set_state(ReservationStates.custom_days)
         await callback.answer()
         return
 
-    days = int(days_str)
+    try:
+        days = int(days_str)
+    except ValueError:
+        await callback.answer("Некорректное значение", show_alert=True)
+        return
+
     await _process_reservation(callback, state, days)
 
 
 @router.message(ReservationStates.custom_days)
 async def process_custom_days(message: Message, state: FSMContext):
     """Обработка ввода произвольного срока"""
-    # ИЗМЕНЕНИЕ v2: days ge=1, le=90 (валидатор уже проверяет это)
-    is_valid, days, error_msg = validate_days(message.text)
+    is_valid, days, error_msg = validate_days(message.text or "")
 
     if not is_valid:
         await message.answer(error_msg, parse_mode="HTML")
@@ -104,63 +166,63 @@ async def process_custom_days(message: Message, state: FSMContext):
     book_id = data.get("reserve_book_id")
     user_id = message.from_user.id
 
+    if not book_id:
+        await state.clear()
+        await message.answer(
+            "❌ Сессия устарела. Начните бронирование заново.",
+            reply_markup=main_menu_keyboard(user_id in settings.admin_ids_set),
+        )
+        return
+
     loading = await message.answer("⏳ Отправляем запрос...")
 
     try:
         await api.request_reservation(book_id, user_id, days)
         await state.clear()
-        due_date = (datetime.now() + timedelta(days=days)).strftime("%d.%m.%Y")
+        await safe_delete_message(loading)
 
-        try:
-            await loading.delete()
-        except Exception:
-            pass
-
-        is_admin = user_id in settings.admin_ids_list
+        is_admin = user_id in settings.admin_ids_set
         await message.answer(
-            f"✅ <b>Запрос на бронирование отправлен!</b>\n\n"
-            f"📅 Желаемый срок: {days} дней (до {due_date})\n\n"
-            f"⏳ Ожидайте подтверждения от администратора.\n"
-            f"Вы получите уведомление когда заявка будет обработана.",
+            _make_success_text(days),
             reply_markup=main_menu_keyboard(is_admin),
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
 
+    except APIError as e:
+        await safe_delete_message(loading)
+        await state.clear()
+        is_admin = user_id in settings.admin_ids_set
+        await message.answer(
+            _format_reservation_error(e),
+            reply_markup=main_menu_keyboard(is_admin),
+            parse_mode="HTML",
+        )
+        logger.error(
+            "Error in reservation (custom days, book %d): HTTP %d %s",
+            book_id, e.status, e.message,
+        )
     except Exception as e:
-        try:
-            await loading.delete()
-        except Exception:
-            pass
-
-        error_msg = str(e)
-        user_id = message.from_user.id
-        is_admin = user_id in settings.admin_ids_list
-
-        # ИЗМЕНЕНИЕ v2: новая 409 при превышении лимита одновременных книг
-        if "409" in error_msg:
-            if "5 книг" in error_msg or "более 5" in error_msg:
-                text = (
-                    "❌ <b>Превышен лимит книг</b>\n\n"
-                    "Нельзя иметь более 5 книг одновременно.\n"
-                    "Верните уже взятые книги."
-                )
-            else:
-                text = (
-                    "❌ <b>Книга уже забронирована</b>\n\n"
-                    "Хотите встать в лист ожидания?"
-                )
-        else:
-            text = "❌ Ошибка бронирования. Попробуйте позже."
-
-        await message.answer(text, reply_markup=main_menu_keyboard(is_admin), parse_mode="HTML")
-        print(f"Error in reservation: {e}")
+        await safe_delete_message(loading)
+        await state.clear()
+        is_admin = user_id in settings.admin_ids_set
+        await message.answer(
+            "❌ Ошибка бронирования. Попробуйте позже.",
+            reply_markup=main_menu_keyboard(is_admin),
+            parse_mode="HTML",
+        )
+        logger.error("Error in reservation (custom days, book %d): %s", book_id, e)
 
 
 async def _process_reservation(callback: CallbackQuery, state: FSMContext, days: int):
-    """Отправка запроса на бронирование в API"""
+    """Отправка запроса на бронирование в API (для callback-пути)."""
     data = await state.get_data()
     book_id = data.get("reserve_book_id")
     user_id = callback.from_user.id
+
+    if not book_id:
+        await state.clear()
+        await callback.answer("Сессия устарела, начните заново", show_alert=True)
+        return
 
     await safe_edit_message(callback.message, "⏳ Отправляем запрос...")
     await callback.answer()
@@ -168,37 +230,16 @@ async def _process_reservation(callback: CallbackQuery, state: FSMContext, days:
     try:
         await api.request_reservation(book_id, user_id, days)
         await state.clear()
+        await _go_home(callback.message, user_id, _make_success_text(days))
 
-        due_date = (datetime.now() + timedelta(days=days)).strftime("%d.%m.%Y")
-        await _go_home(
-            callback.message,
-            user_id,
-            f"✅ <b>Запрос на бронирование отправлен!</b>\n\n"
-            f"📅 Срок: {days} дней (до {due_date})\n\n"
-            f"⏳ Ожидайте подтверждения от администратора.\n"
-            f"Вы получите уведомление, когда заявка будет обработана."
-        )
-
+    except APIError as e:
+        await state.clear()
+        await _go_home(callback.message, user_id, _format_reservation_error(e))
+        logger.error("Error in reservation (book %d): HTTP %d %s", book_id, e.status, e.message)
     except Exception as e:
-        error_msg = str(e)
-        # ИЗМЕНЕНИЕ v2: новая 409 при превышении лимита одновременных книг (>5)
-        if "409" in error_msg:
-            if "5 книг" in error_msg or "более 5" in error_msg:
-                text = (
-                    "❌ <b>Превышен лимит книг</b>\n\n"
-                    "Нельзя иметь более 5 книг одновременно.\n"
-                    "Верните уже взятые книги."
-                )
-            else:
-                text = (
-                    "❌ <b>Книга уже забронирована кем-то другим.</b>\n\n"
-                    "Вы можете встать в лист ожидания через каталог."
-                )
-        else:
-            text = "❌ Ошибка бронирования. Попробуйте позже."
-
-        await _go_home(callback.message, user_id, text)
-        print(f"Error in reservation: {e}")
+        await state.clear()
+        await _go_home(callback.message, user_id, "❌ Ошибка бронирования. Попробуйте позже.")
+        logger.error("Error in reservation (book %d): %s", book_id, e)
 
 
 # ---------------------------------------------------------------------------
@@ -207,65 +248,69 @@ async def _process_reservation(callback: CallbackQuery, state: FSMContext, days:
 
 @router.callback_query(F.data.startswith("waitlist:"))
 async def join_waitlist(callback: CallbackQuery):
-    """Добавление в лист ожидания (ТЗ 3.2.2)"""
-    book_id = int(callback.data.split(":")[1])
-    user_id = callback.from_user.id
+    """Добавление в лист ожидания"""
+    try:
+        book_id = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
 
+    user_id = callback.from_user.id
     await callback.answer("⏳ Добавляем в список...")
 
     try:
-        # ИЗМЕНЕНИЕ v2: user_id теперь в JSON-теле, не query-параметр
-        # Новый формат ответа: {"message": "...", "added": true/false}
         result = await api.join_waitlist(book_id, user_id)
+        already_in = isinstance(result, dict) and result.get("added") is False
 
-        if result.get("added") is False:
-            # Уже в очереди — не ошибка
+        if already_in:
             await _go_home(
-                callback.message,
-                user_id,
+                callback.message, user_id,
                 "ℹ️ <b>Вы уже в листе ожидания</b>\n\n"
-                "Когда книга освободится, вы получите уведомление."
+                "Когда книга освободится, вы получите уведомление.",
             )
         else:
             await _go_home(
-                callback.message,
-                user_id,
+                callback.message, user_id,
                 "🔔 <b>Вы добавлены в лист ожидания!</b>\n\n"
                 "Когда книга освободится, вы получите уведомление.\n\n"
-                "💡 Успейте первым забронировать её!"
+                "💡 Успейте первым забронировать её!",
             )
 
-    except Exception as e:
-        error_msg = str(e)
-        if "400" in error_msg:
-            if "свою" in error_msg.lower() or "owner" in error_msg.lower():
+    except APIError as e:
+        if e.status == 400:
+            msg = e.message.lower()
+            if "свою" in msg or "owner" in msg:
                 text = "❌ Нельзя встать в очередь на свою книгу."
-            elif "держите" in error_msg.lower() or "borrower" in error_msg.lower():
+            elif "держите" in msg or "borrower" in msg:
                 text = "❌ Нельзя встать в очередь на книгу, которую держите."
             else:
                 text = "❌ Ошибка добавления в лист ожидания."
             await _go_home(callback.message, user_id, text)
         else:
             await callback.answer("Ошибка добавления в лист ожидания", show_alert=True)
-        print(f"Error joining waitlist: {e}")
+        logger.error("Error joining waitlist (book %d): HTTP %d %s", book_id, e.status, e.message)
+    except Exception as e:
+        await callback.answer("Ошибка добавления в лист ожидания", show_alert=True)
+        logger.error("Error joining waitlist (book %d): %s", book_id, e)
 
 
 @router.callback_query(F.data.startswith("leave_waitlist:"))
 async def leave_waitlist(callback: CallbackQuery):
-    """НОВЫЙ v2: Покинуть лист ожидания"""
-    book_id = int(callback.data.split(":")[1])
+    """Покинуть лист ожидания"""
+    try:
+        book_id = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+
     user_id = callback.from_user.id
 
     try:
         await api.leave_waitlist(book_id, user_id)
-        await _go_home(
-            callback.message,
-            user_id,
-            "✅ Вы покинули лист ожидания."
-        )
+        await _go_home(callback.message, user_id, "✅ Вы покинули лист ожидания.")
     except Exception as e:
         await callback.answer("Ошибка", show_alert=True)
-        print(f"Error leaving waitlist: {e}")
+        logger.error("Error leaving waitlist (book %d): %s", book_id, e)
 
 
 # ---------------------------------------------------------------------------
@@ -275,9 +320,14 @@ async def leave_waitlist(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("return:"))
 async def start_return_book(callback: CallbackQuery, state: FSMContext):
     """Начало процесса возврата книги (ТЗ 3.3)"""
-    book_id = int(callback.data.split(":")[1])
+    try:
+        book_id = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+
     user_id = callback.from_user.id
-    is_admin = user_id in settings.admin_ids_list
+    is_admin = user_id in settings.admin_ids_set
 
     try:
         book = await api.get_book(book_id)
@@ -295,25 +345,23 @@ async def start_return_book(callback: CallbackQuery, state: FSMContext):
         await state.update_data(return_book_id=book_id)
         await state.set_state(ReturnBookStates.upload_photo)
 
-        try:
-            await callback.message.delete()
-        except Exception:
-            pass
+        await safe_delete_message(callback.message)
 
+        safe_title = escape_html(book.get("title", "—"))
         await callback.message.answer(
-            f"📖 <b>{book['title']}</b>\n\n"
+            f"📖 <b>{safe_title}</b>\n\n"
             f"📸 <b>Возврат книги</b>\n\n"
             f"Загрузите фотографию книги для подтверждения возврата.\n"
             f"Это поможет владельцу проверить состояние.\n\n"
             f"Или нажмите «Пропустить».",
             reply_markup=return_photo_keyboard(),
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
         await callback.answer()
 
     except Exception as e:
         await callback.answer("Ошибка возврата", show_alert=True)
-        print(f"Error in start_return: {e}")
+        logger.error("Error in start_return (book %d): %s", book_id, e)
 
 
 @router.callback_query(F.data == "skip_return_photo", ReturnBookStates.upload_photo)
@@ -329,12 +377,12 @@ async def process_return_photo(message: Message, state: FSMContext):
     photo = message.photo[-1]
     try:
         file = await message.bot.download(photo.file_id)
-        photo_data = file.read()
+        photo_data = file.getvalue() if isinstance(file, io.BytesIO) else file.read()
         loading = await message.answer("⏳ Обрабатываем возврат...")
         await _do_return(loading, message.from_user.id, state, photo_data)
     except Exception as e:
         await message.answer("❌ Ошибка обработки фото. Попробуйте ещё раз.")
-        print(f"Error processing return photo: {e}")
+        logger.error("Error processing return photo: %s", e)
 
 
 @router.message(ReturnBookStates.upload_photo)
@@ -343,34 +391,47 @@ async def invalid_return_photo(message: Message):
     await message.answer(
         "❌ Пожалуйста, отправьте <b>изображение</b> или нажмите «Пропустить»",
         reply_markup=return_photo_keyboard(),
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
 
-async def _do_return(message: Message, user_id: int, state: FSMContext, photo_data: bytes = None):
-    """
-    Выполняет возврат книги через API.
-    КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ v2: is_admin удалён из FormData.
-    Сервер определяет права по admin-флагу пользователя в БД.
-    Ответ: {"status": "returned"}
-    """
+async def _do_return(
+    message: Message,
+    user_id: int,
+    state: FSMContext,
+    photo_data: Optional[bytes] = None,
+):
+    """Выполняет возврат книги через API."""
     data = await state.get_data()
     book_id = data.get("return_book_id")
+
+    if not book_id:
+        await state.clear()
+        await _go_home(message, user_id, "❌ Сессия устарела. Начните возврат заново.")
+        return
 
     try:
         await api.return_book(book_id, user_id, photo_bytes=photo_data)
         await state.clear()
         await _go_home(
-            message,
-            user_id,
+            message, user_id,
             "✅ <b>Книга успешно возвращена!</b>\n\n"
             "Книга снова доступна в каталоге.\n"
-            "Владелец получил уведомление о возврате."
+            "Владелец получил уведомление о возврате.",
         )
+    except APIError as e:
+        await state.clear()
+        if e.status == 403:
+            text = "❌ Нет прав на возврат этой книги."
+        elif e.status == 400:
+            text = "❌ Книга не числится за вами или уже возвращена."
+        elif e.status == 404:
+            text = "❌ Книга не найдена."
+        else:
+            text = "❌ Ошибка возврата книги. Обратитесь к администратору."
+        await _go_home(message, user_id, text)
+        logger.error("Error returning book %d: HTTP %d %s", book_id, e.status, e.message)
     except Exception as e:
-        await _go_home(
-            message,
-            user_id,
-            "❌ Ошибка возврата книги. Обратитесь к администратору."
-        )
-        print(f"Error returning book: {e}")
+        await state.clear()
+        await _go_home(message, user_id, "❌ Ошибка возврата книги. Обратитесь к администратору.")
+        logger.error("Error returning book %d: %s", book_id, e)

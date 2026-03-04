@@ -1,45 +1,41 @@
 """
 Handler для команды /start и главного меню
 """
+import logging
+
 from aiogram import Router, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
+from aiogram.types import CallbackQuery, Message
 
 from api.client import api
-from keyboards.inline import main_menu_keyboard
 from config import settings
+from keyboards.inline import main_menu_keyboard
+from utils.formatters import escape_html
 from utils.telegram import safe_edit_message
 
-
+logger = logging.getLogger(__name__)
 router = Router()
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    """
-    Обработка команды /start
-    Регистрация/авторизация пользователя в системе
-    """
+    """Обработка команды /start — регистрация/авторизация пользователя"""
     await state.clear()
 
     user_id = message.from_user.id
     full_name = message.from_user.full_name
     username = message.from_user.username
-
-    is_admin = user_id in settings.admin_ids_list
+    is_admin = user_id in settings.admin_ids_set
 
     try:
-        # ИЗМЕНЕНИЕ v2: is_admin удалён из запроса POST /users/auth.
-        # Управление правами теперь через отдельный эндпоинт POST /users/{tg_id}/set-admin.
-        await api.auth_user(
-            tg_id=user_id,
-            full_name=full_name,
-            username=username,
-        )
+        await api.auth_user(tg_id=user_id, full_name=full_name, username=username)
 
+        # escape_html из utils.formatters — единый источник правды для экранирования.
+        # Ранее здесь была локальная escape_html_simple, которая не экранировала «"»,
+        # что создавало расхождение с форматтерами в других частях бота.
         welcome_text = (
-            f"👋 Привет, {full_name}!\n\n"
+            f"👋 Привет, {escape_html(full_name)}!\n\n"
             f"📚 Добро пожаловать в <b>Библиотеку</b> — бот для обмена и учёта книг.\n\n"
             f"Здесь вы можете:\n"
             f"• 📖 Просматривать каталог книг\n"
@@ -61,29 +57,28 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer(
             welcome_text,
             reply_markup=main_menu_keyboard(is_admin=is_admin),
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
 
     except Exception as e:
         await message.answer(
             "❌ Ошибка подключения к серверу. Попробуйте позже.",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
-        print(f"Error in /start: {e}")
+        logger.error("Error in /start for user %d: %s", user_id, e)
 
 
 @router.message(Command("menu"))
 async def cmd_menu(message: Message, state: FSMContext):
-    """Команда /menu - вернуться в главное меню"""
+    """Команда /menu"""
     await state.clear()
-
     user_id = message.from_user.id
-    is_admin = user_id in settings.admin_ids_list
+    is_admin = user_id in settings.admin_ids_set
 
     await message.answer(
         "📋 <b>Главное меню</b>\n\nВыберите действие:",
         reply_markup=main_menu_keyboard(is_admin=is_admin),
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
 
@@ -91,14 +86,13 @@ async def cmd_menu(message: Message, state: FSMContext):
 async def back_to_menu(callback: CallbackQuery, state: FSMContext):
     """Возврат в главное меню через inline кнопку"""
     await state.clear()
-
     user_id = callback.from_user.id
-    is_admin = user_id in settings.admin_ids_list
+    is_admin = user_id in settings.admin_ids_set
 
     await safe_edit_message(
         callback.message,
         "📋 <b>Главное меню</b>\n\nВыберите действие:",
-        reply_markup=main_menu_keyboard(is_admin=is_admin)
+        reply_markup=main_menu_keyboard(is_admin=is_admin),
     )
     await callback.answer()
 
@@ -113,14 +107,13 @@ async def noop_callback(callback: CallbackQuery):
 async def cancel_action(callback: CallbackQuery, state: FSMContext):
     """Отмена текущего действия"""
     await state.clear()
-
     user_id = callback.from_user.id
-    is_admin = user_id in settings.admin_ids_list
+    is_admin = user_id in settings.admin_ids_set
 
     await safe_edit_message(
         callback.message,
         "❌ Действие отменено\n\n📋 <b>Главное меню</b>",
-        reply_markup=main_menu_keyboard(is_admin=is_admin)
+        reply_markup=main_menu_keyboard(is_admin=is_admin),
     )
     await callback.answer("Отменено")
 
@@ -138,7 +131,7 @@ async def cmd_help(message: Message):
         "/help - Эта справка\n"
     )
 
-    if message.from_user.id in settings.admin_ids_list:
+    if message.from_user.id in settings.admin_ids_set:
         help_text += (
             "\n👨‍💼 <b>Команды администратора:</b>\n"
             "/add - Добавить книгу\n"

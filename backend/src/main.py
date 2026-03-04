@@ -472,8 +472,6 @@ DEFAULT_IMAGE_PATH = BOOKS_MEDIA_DIR / "base_cover.jpg"
 if not DEFAULT_IMAGE_PATH.exists():
     logger.warning("Placeholder image not found at %s", DEFAULT_IMAGE_PATH)
 
-app.mount("/media", StaticFiles(directory=MEDIA_ROOT), name="media")
-
 # ---------------------------------------------------------------------------
 # Аутентификация
 # ---------------------------------------------------------------------------
@@ -738,6 +736,9 @@ async def create_book_endpoint(
     genre:       str            = Form(..., max_length=50),
     owner_id:    int            = Form(..., gt=0),
     isbn:        Optional[str]  = Form(None, max_length=20),
+    # image_path — путь к уже загруженному файлу (визард: /media/upload → /books).
+    # Если передан, photo игнорируется — файл уже сохранён на сервере.
+    image_path: Optional[str]   = Form(None, max_length=500),
     photo: Optional[UploadFile] = File(None),
     service: LibraryService     = Depends(get_service),
 ):
@@ -745,7 +746,7 @@ async def create_book_endpoint(
         title=title, author=author, description=description,
         genre=genre, owner_id=owner_id, isbn=isbn,
     )
-    book_id = await service.create_book(book_in, photo)
+    book_id = await service.create_book(book_in, photo=photo, image_path=image_path)
     repo    = BookRepository(service.db)
     book    = await repo.get_book_by_id(book_id)
     return _enrich_book_dto(BookRead.model_validate(book), book)
@@ -942,3 +943,9 @@ async def get_pending_reservations(
 # ---------------------------------------------------------------------------
 app.include_router(protected)
 app.include_router(notification_router, dependencies=[Depends(verify_bot_token)])
+
+# ВАЖНО: StaticFiles монтируется ПОСЛЕ всех роутеров.
+# Если смонтировать /media раньше, Starlette перехватывает POST /media/upload
+# раньше роутера и отвечает 405 Method Not Allowed, т.к. StaticFiles
+# поддерживает только GET/HEAD.
+app.mount("/media", StaticFiles(directory=MEDIA_ROOT), name="media")

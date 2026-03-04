@@ -40,7 +40,21 @@ class LibraryService:
     # CRUD Книги
     # -----------------------------------------------------------------------
 
-    async def create_book(self, book_in: BookCreate, photo: UploadFile = None) -> int:
+    async def create_book(
+        self,
+        book_in: BookCreate,
+        photo: UploadFile = None,
+        image_path: str = None,
+    ) -> int:
+        """
+        Создаёт книгу.
+
+        Приоритет изображения:
+        1. photo — файл загружается прямо сейчас (форма с UploadFile).
+        2. image_path — путь уже загруженного файла (визард: сначала /media/upload,
+           затем POST /books). Файл уже сохранён, просто сохраняем ссылку.
+        3. Fallback — дефолтная обложка.
+        """
         owner = await self.user_repo.get_by_id(book_in.owner_id)
         if not owner:
             raise HTTPException(status_code=404, detail="Владелец не найден")
@@ -53,6 +67,9 @@ class LibraryService:
                 raise
             except Exception as e:
                 logger.error("Failed to save image: %s", e)
+        elif image_path:
+            # Файл уже загружен через /media/upload — просто используем путь.
+            saved_image_path = image_path
 
         final_image_path = saved_image_path or "books/base_cover.jpg"
 

@@ -1,24 +1,37 @@
 """
 Handler поиска книг с нечётким триграммным поиском (UX-friendly)
 """
+import logging
+
 from aiogram import Router, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
+from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.types import InlineKeyboardButton
 
 from api.client import api
-from states.wizard import SearchStates
-from keyboards.inline import main_menu_keyboard, cancel_keyboard
 from config import settings
+from keyboards.inline import main_menu_keyboard
+from states.wizard import SearchStates
+from utils.formatters import escape_html
+from utils.telegram import safe_delete_message, safe_edit_message
 
+logger = logging.getLogger(__name__)
 router = Router()
 
-# Минимальная длина запроса
 MIN_QUERY_LEN = 2
-# Порог "хорошего" совпадения для вывода подсказки
-HINT_THRESHOLD = 3   # если найдено меньше N — покажем подсказку
+
+
+def _pluralize_books(count: int) -> str:
+    """Правильное склонение слова 'книга' для русского языка."""
+    if 11 <= count % 100 <= 19:
+        return "книг"
+    rem = count % 10
+    if rem == 1:
+        return "книга"
+    if 2 <= rem <= 4:
+        return "книги"
+    return "книг"
 
 
 # ---------------------------------------------------------------------------
@@ -30,17 +43,15 @@ async def start_search(callback: CallbackQuery, state: FSMContext):
     """Запрашиваем текст поиска"""
     await state.set_state(SearchStates.query)
 
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-    from aiogram.types import InlineKeyboardButton
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="back_to_menu"))
 
-    await callback.message.edit_text(
+    await safe_edit_message(
+        callback.message,
         "🔍 <b>Поиск книги</b>\n\n"
         "Введите название или автора.\n"
         "Поиск устойчив к опечаткам — не бойтесь ошибаться 😊",
         reply_markup=builder.as_markup(),
-        parse_mode="HTML"
     )
     await callback.answer()
 
@@ -50,8 +61,6 @@ async def search_command(message: Message, state: FSMContext):
     """Поиск через команду /search"""
     await state.set_state(SearchStates.query)
 
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-    from aiogram.types import InlineKeyboardButton
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="back_to_menu"))
 
@@ -59,7 +68,7 @@ async def search_command(message: Message, state: FSMContext):
         "🔍 <b>Поиск книги</b>\n\n"
         "Введите название или автора.",
         reply_markup=builder.as_markup(),
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
 
@@ -72,34 +81,34 @@ async def process_search_query(message: Message, state: FSMContext):
     """Выполняем поиск и показываем результаты"""
     query = message.text.strip() if message.text else ""
     user_id = message.from_user.id
-    is_admin = user_id in settings.admin_ids_list
+    is_admin = user_id in settings.admin_ids_set
 
     if len(query) < MIN_QUERY_LEN:
         await message.answer(
             f"❌ Запрос слишком короткий. Введите минимум {MIN_QUERY_LEN} символа.",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
         return
 
-    # Индикатор загрузки
     loading = await message.answer("🔍 Ищем...")
 
     try:
         books = await api.get_books(query=query)
     except Exception as e:
-        await loading.delete()
+        await safe_delete_message(loading)
         await message.answer(
             "❌ Ошибка поиска. Попробуйте позже.",
             reply_markup=main_menu_keyboard(is_admin),
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
-        print(f"Search error: {e}")
+        logger.error("Search error for query %r: %s", query, e)
         return
 
-    await loading.delete()
+    await safe_delete_message(loading)
     await state.clear()
 
-    # ── Ничего не найдено ──────────────────────────────────────────────────
+    safe_query = escape_html(query)
+
     if not books:
         builder = InlineKeyboardBuilder()
         builder.row(InlineKeyboardButton(text="🔍 Попробовать снова", callback_data="search"))
@@ -107,30 +116,21 @@ async def process_search_query(message: Message, state: FSMContext):
         builder.row(InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_menu"))
 
         await message.answer(
-            f"😔 <b>По запросу «{query}» ничего не найдено</b>\n\n"
+            f"😔 <b>По запросу «{safe_query}» ничего не найдено</b>\n\n"
             f"Попробуйте:\n"
             f"• Проверить написание\n"
             f"• Ввести только часть слова\n"
             f"• Поискать по автору вместо названия",
             reply_markup=builder.as_markup(),
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
         return
 
-    # ── Результаты ────────────────────────────────────────────────────────
     count = len(books)
-
-    # Заголовок с подсказкой качества
-    if count == 1:
-        header = f"✅ <b>Найдена 1 книга</b> по запросу «{query}»:\n\n"
-    elif count < HINT_THRESHOLD:
-        header = f"🔎 <b>Найдено {count} книги</b> по запросу «{query}»:\n\n"
-    else:
-        header = f"📚 <b>Найдено {count} книг</b> по запросу «{query}»:\n\n"
+    word = _pluralize_books(count)
+    header = f"📚 <b>Найдено {count} {word}</b> по запросу «{safe_query}»:\n\n"
 
     status_emoji = {"available": "🟢", "reserved": "🟡", "borrowed": "🔴", "overdue": "⏳"}
-
-    # Строим клавиатуру и текст-список
     builder = InlineKeyboardBuilder()
 
     text = header
@@ -138,23 +138,24 @@ async def process_search_query(message: Message, state: FSMContext):
         emoji = status_emoji.get(book.get("status", "available"), "⚪️")
         title = book.get("title", "—")
         author = book.get("author", "—")
+        # FIX: book.get("id", 0) вместо book["id"] — KeyError если id отсутствует
+        book_id = book.get("id", 0)
 
-        # Обрезаем длинные названия для кнопки
         btn_label = title if len(title) <= 32 else title[:30] + ".."
         builder.row(InlineKeyboardButton(
             text=f"{emoji} {btn_label}",
-            callback_data=f"book:{book['id']}"
+            callback_data=f"book:{book_id}",
         ))
 
-        # Текст-список (краткий)
-        text += f"{i}. {emoji} <b>{title}</b>\n"
-        text += f"   ✍️ {author}\n"
-        if book.get("status") == "available":
-            text += f"   <i>Доступна</i>\n"
-        elif book.get("status") in ("borrowed", "overdue"):
-            text += f"   <i>Выдана</i>\n"
-        elif book.get("status") == "reserved":
-            text += f"   <i>Забронирована</i>\n"
+        text += f"{i}. {emoji} <b>{escape_html(title)}</b>\n"
+        text += f"   ✍️ {escape_html(author)}\n"
+        status = book.get("status")
+        if status == "available":
+            text += "   <i>Доступна</i>\n"
+        elif status in ("borrowed", "overdue"):
+            text += "   <i>Выдана</i>\n"
+        elif status == "reserved":
+            text += "   <i>Забронирована</i>\n"
         text += "\n"
 
     if count > 10:

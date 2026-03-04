@@ -6,17 +6,17 @@ from aiogram.fsm.state import State, StatesGroup
 
 class AddBookWizard(StatesGroup):
     """Визард добавления книги (ТЗ 3.1)"""
-    author = State()          # Шаг 1: Ввод автора
-    title = State()           # Шаг 2: Ввод названия
-    photo = State()           # Шаг 3: Загрузка фото (опционально)
-    description = State()     # Шаг 4: Описание и выбор жанра
-    owner = State()           # Шаг 5: Выбор владельца
-    confirm = State()         # Шаг 6: Подтверждение
+    author = State()
+    title = State()
+    photo = State()
+    description = State()
+    owner = State()
+    confirm = State()
 
 
 class EditBookStates(StatesGroup):
     """Редактирование книги (ТЗ 4.1)"""
-    select_field = State()    # Выбор поля для редактирования
+    select_field = State()
     edit_author = State()
     edit_title = State()
     edit_photo = State()
@@ -26,25 +26,25 @@ class EditBookStates(StatesGroup):
 
 class ReservationStates(StatesGroup):
     """Бронирование книги"""
-    select_days = State()     # Выбор срока бронирования
-    custom_days = State()     # Ввод произвольного срока
+    select_days = State()
+    custom_days = State()
 
 
 class ReturnBookStates(StatesGroup):
     """Возврат книги"""
-    upload_photo = State()    # Загрузка фото книги
+    upload_photo = State()
 
 
 class SearchStates(StatesGroup):
     """Поиск книг"""
-    query = State()           # Ввод поискового запроса
+    query = State()
 
 
 class AdminRejectStates(StatesGroup):
     """Отклонение брони админом"""
-    reason = State()          # Ввод причины отклонения
+    reason = State()
 
 
 class AdminApproveStates(StatesGroup):
     """Подтверждение брони админом"""
-    due_date = State()        # Выбор даты возврата
+    due_date = State()

@@ -1,11 +1,38 @@
 """
 HTTP клиент для взаимодействия с Library API (v2)
 """
-
 import asyncio
+import logging
+import mimetypes
+from typing import Any, Dict, List, Optional
+
 import aiohttp
-from typing import Optional, List, Dict, Any
+
 from config import settings
+
+logger = logging.getLogger(__name__)
+
+_IMAGE_MAX_BYTES = 10 * 1024 * 1024  # 10 МБ
+_IMAGE_CHUNK_SIZE = 65_536            # 64 КБ за чтение
+_VALID_IMAGE_CONTENT_TYPES = frozenset({
+    "image/jpeg", "image/png", "image/webp", "image/gif",
+})
+
+
+class APIError(Exception):
+    """
+    API-ошибка с HTTP-статусом.
+
+    Заменяет хрупкое `"403" in str(e)` во всех хендлерах:
+    теперь можно проверять `e.status == 403` напрямую.
+    Гарантирует, что статус-код никогда не будет False Positive
+    из-за цифр в теле ответа.
+    """
+
+    def __init__(self, status: int, message: str = ""):
+        self.status = status
+        self.message = message
+        super().__init__(f"HTTP {status}: {message}")
 
 
 class APIClient:
@@ -13,25 +40,45 @@ class APIClient:
 
     def __init__(self):
         self.base_url = settings.api_url.rstrip("/")
-        self.session: Optional[aiohttp.ClientSession] = None
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._health_session: Optional[aiohttp.ClientSession] = None
+        # Lock предотвращает race condition: два корутина могут одновременно
+        # увидеть self._session.closed == True и создать две сессии.
+        self._session_lock = asyncio.Lock()
+        self._health_session_lock = asyncio.Lock()
 
     # =========================================
     # SESSION
     # =========================================
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        if not self.session or self.session.closed:
-            self.session = aiohttp.ClientSession(
-                headers={
-                    "X-API-Token": settings.api_token
-                },
-                timeout=aiohttp.ClientTimeout(total=30)
-            )
-        return self.session
+        async with self._session_lock:
+            if not self._session or self._session.closed:
+                connector = aiohttp.TCPConnector(
+                    limit=20,
+                    ttl_dns_cache=300,
+                    keepalive_timeout=30,
+                )
+                self._session = aiohttp.ClientSession(
+                    connector=connector,
+                    headers={"X-API-Token": settings.api_token},
+                    timeout=aiohttp.ClientTimeout(total=30, connect=5),
+                )
+        return self._session
+
+    async def _get_health_session(self) -> aiohttp.ClientSession:
+        """Сессия для /health без заголовка X-API-Token."""
+        async with self._health_session_lock:
+            if not self._health_session or self._health_session.closed:
+                self._health_session = aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=10)
+                )
+        return self._health_session
 
     async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
+        for s in (self._session, self._health_session):
+            if s and not s.closed:
+                await s.close()
 
     # =========================================
     # BASE REQUEST
@@ -39,86 +86,110 @@ class APIClient:
 
     async def _request(self, method: str, endpoint: str, **kwargs) -> Any:
         """
-        Выполняет HTTP-запрос с обработкой новых кодов ответа v2:
-          - 429: Retry-After — ждём и повторяем
-          - 413: тело запроса слишком большое
-          - 415: неподдерживаемый тип файла
-          - 404: возвращаем None
-          - 503: сервис временно недоступен
+        Выполняет HTTP-запрос с retry для 429, 500, 503 и ошибок соединения.
+        Бросает APIError(status, message) для всех HTTP 4xx/5xx ответов.
+
+        FIX: На последней попытке (attempt == 2) при 429 ранее выполнялся
+        бесполезный sleep(wait), после которого `continue` выходил из цикла
+        и выбрасывался RuntimeError("Превышено число попыток"). Теперь на
+        последней попытке мы немедленно поднимаем APIError(429), не тратя
+        время на sleep перед гарантированной ошибкой.
+
+        Сессия получается внутри каждой попытки: если сессия закрылась
+        (например, из-за ClientConnectorError на предыдущей итерации и
+        последующего пересоздания), следующий retry получает свежую сессию,
+        а не использует закрытую из-за закешированной ссылки снаружи loop.
         """
-        session = await self._get_session()
         url = f"{self.base_url}{endpoint}"
 
         for attempt in range(3):
-            async with session.request(method, url, **kwargs) as response:
+            # Получаем сессию на каждой попытке — безопасно при закрытии.
+            session = await self._get_session()
+            try:
+                async with session.request(method, url, **kwargs) as response:
 
-                # 429 — превышен лимит запросов, ждём Retry-After
-                if response.status == 429:
-                    retry_after = int(response.headers.get("Retry-After", "5"))
-                    print(f"⚠️ Rate limited. Retrying after {retry_after}s...")
-                    await asyncio.sleep(retry_after)
-                    continue
-
-                # 404 — просто возвращаем None
-                if response.status == 404:
-                    return None
-
-                # Попытка прочитать JSON
-                try:
-                    data = await response.json()
-                except Exception:
-                    data = await response.text()
-
-                # Обработка ошибок
-                if response.status >= 400:
-                    print(f"\n❌ HTTP {response.status} at {endpoint}")
-                    print(data)
-
-                    if response.status == 413:
-                        raise aiohttp.ClientResponseError(
-                            request_info=response.request_info,
-                            history=response.history,
-                            status=413,
-                            message="Request body too large (>1MB)",
-                            headers=response.headers,
+                    if response.status == 429:
+                        # FIX: не спим перед последней попыткой — это бесполезно.
+                        # На attempts 0 и 1 делаем retry; на attempt 2 — сразу ошибка.
+                        if attempt < 2:
+                            raw = response.headers.get("Retry-After", "5")
+                            try:
+                                wait = min(int(raw), 60)
+                            except ValueError:
+                                wait = 5
+                            logger.warning(
+                                "Rate limited on %s (attempt %d). Retry in %ds...",
+                                endpoint, attempt, wait,
+                            )
+                            await asyncio.sleep(wait)
+                            continue
+                        # attempt == 2: поднимаем явную APIError вместо RuntimeError
+                        logger.error(
+                            "Rate limited on %s after %d attempts, giving up.",
+                            endpoint, attempt + 1,
                         )
-                    if response.status == 415:
-                        raise aiohttp.ClientResponseError(
-                            request_info=response.request_info,
-                            history=response.history,
-                            status=415,
-                            message="Unsupported media type. Allowed: JPEG, PNG, WebP, GIF",
-                            headers=response.headers,
-                        )
+                        raise APIError(429, "Rate limited")
 
-                    raise aiohttp.ClientResponseError(
-                        request_info=response.request_info,
-                        history=response.history,
-                        status=response.status,
-                        message=str(data),
-                        headers=response.headers,
+                    if response.status in (500, 503) and attempt < 2:
+                        wait = 2 ** attempt  # 1s, 2s
+                        logger.warning(
+                            "Server error %d on %s (attempt %d). Retry in %ds...",
+                            response.status, endpoint, attempt, wait,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+
+                    if response.status == 404:
+                        return None
+
+                    try:
+                        data = await response.json()
+                    except Exception:
+                        data = await response.text()
+
+                    if response.status >= 400:
+                        # Извлекаем читаемое сообщение из ответа API
+                        detail = ""
+                        if isinstance(data, dict):
+                            detail = data.get("detail") or data.get("message") or str(data)
+                        else:
+                            detail = str(data)
+
+                        logger.error("HTTP %d at %s: %s", response.status, endpoint, detail)
+                        raise APIError(response.status, detail)
+
+                    return data
+
+            except asyncio.TimeoutError:
+                if attempt < 2:
+                    wait = 2 ** attempt
+                    logger.warning(
+                        "Timeout on %s (attempt %d). Retry in %ds...",
+                        endpoint, attempt, wait,
                     )
+                    await asyncio.sleep(wait)
+                    continue
+                raise RuntimeError(f"Превышен таймаут запроса к {endpoint}") from None
 
-                return data
+            except aiohttp.ClientConnectorError as e:
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                raise RuntimeError(f"Не удалось подключиться к API: {e}") from e
 
-        # Если все попытки после 429 исчерпаны
-        raise RuntimeError(f"Max retries exceeded for {endpoint}")
+            except APIError:
+                raise  # не retry-им клиентские ошибки
+
+        raise RuntimeError(f"Превышено число попыток для {endpoint}")
 
     # =========================================
     # PAGINATION HELPER
     # =========================================
 
     def _extract_items(self, response: Any) -> List[Dict]:
-        """
-        Извлекает список items из нового формата Page{} ответа.
-        Все list-эндпоинты теперь возвращают:
-          { "items": [...], "total": N, "limit": 50, "offset": 0 }
-        При поиске (query) total == -1; используем len(items) == limit
-        для определения наличия следующей страницы.
-        """
+        """Извлекает список items из Page{} ответа."""
         if isinstance(response, dict) and "items" in response:
             return response["items"]
-        # Фолбек: если вдруг вернулся прямой список (не должно быть в v2)
         if isinstance(response, list):
             return response
         return []
@@ -133,33 +204,11 @@ class APIClient:
         full_name: str,
         username: Optional[str] = None,
     ) -> Dict:
-        """
-        POST /users/auth
-        ИЗМЕНЕНИЕ v2: поле is_admin удалено из запроса.
-        Управление правами через отдельный эндпоинт set_admin.
-        """
-        payload = {
-            "tg_id": tg_id,
-            "full_name": full_name,
-            "username": username,
-        }
+        payload = {"tg_id": tg_id, "full_name": full_name, "username": username}
         return await self._request("POST", "/users/auth", json=payload)
 
-    async def set_admin(
-        self,
-        tg_id: int,
-        is_admin: bool,
-        requester_id: int,
-    ) -> Dict:
-        """
-        НОВЫЙ v2: POST /users/{tg_id}/set-admin
-        Управление флагом администратора. Требует прав у вызывающего.
-        Администратор не может лишить себя прав.
-        """
-        payload = {
-            "is_admin": is_admin,
-            "requester_id": requester_id,
-        }
+    async def set_admin(self, tg_id: int, is_admin: bool, requester_id: int) -> Dict:
+        payload = {"is_admin": is_admin, "requester_id": requester_id}
         return await self._request("POST", f"/users/{tg_id}/set-admin", json=payload)
 
     async def search_users(
@@ -168,14 +217,7 @@ class APIClient:
         limit: int = 50,
         offset: int = 0,
     ) -> List[Dict]:
-        """
-        GET /users
-        ИЗМЕНЕНИЕ v2: возвращает Page[UserRead] вместо List[UserRead].
-        Параметр q: минимум 2 символа, пустая строка = показать всех.
-        UserRead теперь включает поля created_at и tg_id (алиас для id).
-        """
         params: Dict[str, Any] = {"limit": limit, "offset": offset}
-        # Пустая строка = показать всех; строка < 2 символов → API вернёт 400
         if query:
             if len(query) < 2:
                 return []
@@ -188,14 +230,102 @@ class APIClient:
     # =========================================
 
     async def upload_media(self, file_bytes: bytes, filename: str = "image.jpg") -> Dict:
+        """Определяем content_type из имени файла, не хардкодим image/jpeg."""
+        content_type, _ = mimetypes.guess_type(filename)
+        if not content_type or not content_type.startswith("image/"):
+            content_type = "image/jpeg"
+
         data = aiohttp.FormData()
-        data.add_field(
-            "file",
-            file_bytes,
-            filename=filename,
-            content_type="image/jpeg"
-        )
+        data.add_field("file", file_bytes, filename=filename, content_type=content_type)
         return await self._request("POST", "/media/upload", data=data)
+
+    async def get_image_bytes(self, image_path: str) -> Optional[bytes]:
+        """
+        Скачивает изображение по внутреннему пути.
+
+        Защита:
+        - Path-traversal: rejecting paths with ".." or leading "/"
+        - Content-Type: принимаем только image/* ответы
+        - Размер: жёсткий лимит через стриминг (Content-Length необязателен)
+
+        Retry: до 3 попыток при TimeoutError и ClientConnectorError,
+        аналогично _request — для консистентности поведения клиента.
+        """
+        if not image_path or ".." in image_path or image_path.startswith("/"):
+            logger.warning("Rejected suspicious image_path: %r", image_path)
+            return None
+
+        url = f"{self.base_url}/media/{image_path}"
+
+        for attempt in range(3):
+            session = await self._get_session()
+            try:
+                async with session.get(url) as response:
+                    if response.status == 404:
+                        return None
+                    if response.status != 200:
+                        if response.status in (500, 503) and attempt < 2:
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                        logger.error("Failed to get image %s: %d", image_path, response.status)
+                        return None
+
+                    # Валидируем Content-Type — защита от получения не-изображения
+                    content_type = (
+                        response.headers.get("Content-Type", "").split(";")[0].strip().lower()
+                    )
+                    if content_type and content_type not in _VALID_IMAGE_CONTENT_TYPES:
+                        logger.warning(
+                            "Image %s rejected: unexpected Content-Type %r",
+                            image_path, content_type,
+                        )
+                        return None
+
+                    # Быстрая проверка по Content-Length до начала загрузки
+                    content_length = response.headers.get("Content-Length")
+                    if content_length:
+                        try:
+                            if int(content_length) > _IMAGE_MAX_BYTES:
+                                logger.warning(
+                                    "Image %s rejected: Content-Length=%s exceeds %d bytes",
+                                    image_path, content_length, _IMAGE_MAX_BYTES,
+                                )
+                                return None
+                        except ValueError:
+                            pass
+
+                    # Читаем чанками с жёстким ограничением по реальному размеру
+                    chunks: list[bytes] = []
+                    total_size = 0
+                    async for chunk in response.content.iter_chunked(_IMAGE_CHUNK_SIZE):
+                        total_size += len(chunk)
+                        if total_size > _IMAGE_MAX_BYTES:
+                            logger.warning(
+                                "Image %s aborted: exceeded %d bytes (got %d so far)",
+                                image_path, _IMAGE_MAX_BYTES, total_size,
+                            )
+                            return None
+                        chunks.append(chunk)
+
+                    return b"".join(chunks)
+
+            except asyncio.TimeoutError:
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                logger.error("Timeout fetching image %s after %d attempts", image_path, attempt + 1)
+                return None
+            except aiohttp.ClientConnectorError as e:
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                logger.error("Connection error fetching image %s: %s", image_path, e)
+                return None
+            except Exception as e:
+                logger.error("Unexpected error fetching image %s: %s", image_path, e)
+                return None
+
+        return None
 
     # =========================================
     # BOOKS
@@ -214,128 +344,83 @@ class APIClient:
         limit: int = 50,
         offset: int = 0,
     ) -> List[Dict]:
-        """
-        GET /books → Page[BookRead]
-        ИЗМЕНЕНИЕ v2:
-          - query: минимум 2 символа, иначе HTTP 400
-          - genre: max_length 50 символов
-          - user_id: должен быть > 0
-          - добавлены limit/offset (пагинация)
-          - genre в ответе может быть null (не конвертируется в "Другое")
-        """
         params: Dict[str, Any] = {"limit": limit, "offset": offset}
         if status:
             params["status"] = status
         if genre:
-            params["genre"] = genre[:50]  # max_length = 50
+            params["genre"] = genre[:50]
         if query:
             if len(query) < 2:
                 return []
             params["query"] = query
         if user_id and user_id > 0:
             params["user_id"] = user_id
-
-        response = await self._request("GET", "/books", params=params or None)
-        return self._extract_items(response)
+        response = await self._request("GET", "/books", params=params)
+        # Явный guard на None: 404 возвращает None, _extract_items это обрабатывает,
+        # но единообразная проверка здесь делает намерение прозрачным.
+        return self._extract_items(response) if response is not None else []
 
     async def get_book(self, book_id: int) -> Optional[Dict]:
-        """
-        GET /books/{book_id}
-        ИЗМЕНЕНИЕ v2: book_id должен быть > 0.
-        Сообщение ошибки на русском: "Книга не найдена".
-        Поле genre может быть null.
-        """
         if book_id <= 0:
             return None
         return await self._request("GET", f"/books/{book_id}")
 
     async def create_book(self, book_data: Dict, photo_bytes: Optional[bytes] = None) -> Dict:
         """
-        POST /books
-        ИЗМЕНЕНИЕ v2: добавлено поле isbn (опционально, max 20 символов).
-        author: min_length=2 (было 3), убрана проверка на "2 слова".
-        title: min_length=1, max_length=200, whitespace trim.
-        owner_id: должен быть > 0.
-        description: max_length=2000.
-        genre: max_length=50.
+        Создаёт книгу через multipart/form-data.
+
+        Фильтруем None И пустые строки: API некоторых версий интерпретирует
+        пустую строку как заданное значение, что может перезаписать дефолты.
+        photo_content_type / photo_filename — служебные поля, не передаются в API.
         """
+        _INTERNAL_FIELDS = {"photo_content_type", "photo_filename"}
+
         data = aiohttp.FormData()
         for key, value in book_data.items():
-            if value is not None:
+            if value is not None and value != "" and key not in _INTERNAL_FIELDS:
                 data.add_field(key, str(value))
 
         if photo_bytes:
+            photo_content_type = book_data.get("photo_content_type", "image/jpeg")
+            photo_filename = book_data.get("photo_filename", "cover.jpg")
             data.add_field(
-                "photo",
-                photo_bytes,
-                filename="base_cover.jpg",
-                content_type="image/jpeg"
+                "photo", photo_bytes,
+                filename=photo_filename,
+                content_type=photo_content_type,
             )
-
         return await self._request("POST", "/books", data=data)
 
     async def update_book(self, book_id: int, user_id: int, update_data: Dict) -> Dict:
-        """
-        PATCH /books/{book_id}
-        КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ v2: user_id перенесён из query-параметра в JSON-тело.
-        Было: PATCH /books/1?user_id=123  { "title": "..." }
-        Стало: PATCH /books/1  { "user_id": 123, "title": "..." }
-        Поле isbn теперь также поддерживается.
-        """
-        payload = {"user_id": user_id, **update_data}
+        # Фильтруем только None — пустые строки передаём явно (например, для удаления описания)
+        payload = {
+            "user_id": user_id,
+            **{k: v for k, v in update_data.items() if v is not None},
+        }
         return await self._request("PATCH", f"/books/{book_id}", json=payload)
 
     async def delete_book(self, book_id: int, user_id: int) -> Dict:
-        """
-        DELETE /books/{book_id}
-        ИЗМЕНЕНИЕ v2: user_id > 0 обязательно.
-        Ответ изменился с произвольного JSON на {"status": "deleted"}.
-        """
-        return await self._request(
-            "DELETE",
-            f"/books/{book_id}",
-            params={"user_id": user_id}
-        )
+        return await self._request("DELETE", f"/books/{book_id}", params={"user_id": user_id})
 
     # =========================================
     # RESERVATIONS
     # =========================================
 
     async def request_reservation(self, book_id: int, user_id: int, days: int = 14) -> Dict:
-        """
-        POST /books/{book_id}/reserve
-        ИЗМЕНЕНИЕ v2: days теперь ge=1, le=90 (было только default=14).
-        user_id: gt=0.
-        Новая ошибка 409 при превышении лимита одновременных книг (>5).
-        """
         return await self._request(
-            "POST",
-            f"/books/{book_id}/reserve",
-            json={"user_id": user_id, "days": days}
+            "POST", f"/books/{book_id}/reserve",
+            json={"user_id": user_id, "days": days},
         )
 
     async def approve_reservation(self, book_id: int, admin_id: int, due_date: str) -> Dict:
-        """
-        POST /books/{book_id}/approve
-        ИЗМЕНЕНИЕ v2: due_date обязана быть в будущем и не далее чем через 730 дней.
-        admin_id: gt=0. HTTP 403 если не администратор.
-        """
         return await self._request(
-            "POST",
-            f"/books/{book_id}/approve",
-            json={"admin_id": admin_id, "due_date": due_date}
+            "POST", f"/books/{book_id}/approve",
+            json={"admin_id": admin_id, "due_date": due_date},
         )
 
     async def reject_reservation(self, book_id: int, admin_id: int, reason: str) -> Dict:
-        """
-        POST /books/{book_id}/reject
-        ИЗМЕНЕНИЕ v2: reason max_length=500. admin_id: gt=0.
-        HTTP 400 если книга не в статусе RESERVED.
-        """
         return await self._request(
-            "POST",
-            f"/books/{book_id}/reject",
-            json={"admin_id": admin_id, "reason": reason}
+            "POST", f"/books/{book_id}/reject",
+            json={"admin_id": admin_id, "reason": reason},
         )
 
     async def return_book(
@@ -343,25 +428,19 @@ class APIClient:
         book_id: int,
         user_id: int,
         photo_bytes: Optional[bytes] = None,
+        photo_filename: str = "return_photo.jpg",
     ) -> Dict:
-        """
-        POST /books/{book_id}/return
-        КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ v2: поле is_admin удалено из FormData.
-        Права определяются сервером по admin-флагу пользователя.
-        Ответ изменился на {"status": "returned"}.
-        """
         data = aiohttp.FormData()
         data.add_field("user_id", str(user_id))
-        # is_admin УДАЛЁН — сервер определяет права самостоятельно
-
         if photo_bytes:
+            content_type, _ = mimetypes.guess_type(photo_filename)
+            if not content_type or not content_type.startswith("image/"):
+                content_type = "image/jpeg"
             data.add_field(
-                "photo",
-                photo_bytes,
-                filename="return_photo.jpg",
-                content_type="image/jpeg"
+                "photo", photo_bytes,
+                filename=photo_filename,
+                content_type=content_type,
             )
-
         return await self._request("POST", f"/books/{book_id}/return", data=data)
 
     # =========================================
@@ -369,53 +448,24 @@ class APIClient:
     # =========================================
 
     async def join_waitlist(self, book_id: int, user_id: int) -> Dict:
-        """
-        POST /books/{book_id}/waitlist
-        КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ v2: user_id теперь в JSON-теле, не query-параметр.
-        Было: POST /books/1/waitlist?user_id=123
-        Стало: POST /books/1/waitlist  { "user_id": 123 }
-        Новый формат ответа: {"message": "...", "added": true/false}
-        added=false если уже в очереди (не ошибка).
-        HTTP 400 если пытается встать в очередь на свою или держимую книгу.
-        """
         return await self._request(
-            "POST",
-            f"/books/{book_id}/waitlist",
-            json={"user_id": user_id}
+            "POST", f"/books/{book_id}/waitlist",
+            json={"user_id": user_id},
         )
 
     async def leave_waitlist(self, book_id: int, user_id: int) -> Dict:
-        """
-        НОВЫЙ v2: DELETE /books/{book_id}/waitlist?user_id={user_id}
-        Идемпотентный: если пользователь не в очереди — всё равно HTTP 200.
-        """
         return await self._request(
-            "DELETE",
-            f"/books/{book_id}/waitlist",
-            params={"user_id": user_id}
+            "DELETE", f"/books/{book_id}/waitlist",
+            params={"user_id": user_id},
         )
 
     # =========================================
     # BOOK HISTORY
     # =========================================
 
-    async def get_book_history(
-        self,
-        book_id: int,
-        limit: int = 50,
-        offset: int = 0,
-    ) -> List[Dict]:
-        """
-        GET /books/{book_id}/history → Page[BookHistoryRead]
-        ИЗМЕНЕНИЕ v2: возвращает Page вместо List.
-        BookStatus теперь включает DELETED ("deleted") для мягко удалённых книг.
-        """
+    async def get_book_history(self, book_id: int, limit: int = 50, offset: int = 0) -> List[Dict]:
         params = {"limit": limit, "offset": offset}
-        response = await self._request(
-            "GET",
-            f"/books/{book_id}/history",
-            params=params
-        )
+        response = await self._request("GET", f"/books/{book_id}/history", params=params)
         return self._extract_items(response) if response else []
 
     # =========================================
@@ -423,69 +473,32 @@ class APIClient:
     # =========================================
 
     async def get_pending_reservations(
-        self,
-        requester_id: int,
-        limit: int = 50,
-        offset: int = 0,
+        self, requester_id: int, limit: int = 50, offset: int = 0
     ) -> List[Dict]:
-        """
-        КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ v2:
-        Было:    GET  /admin/pending-reservations
-        Стало:   POST /admin/pending-reservations  { "requester_id": ... }
-        Добавлена авторизационная проверка: HTTP 403 если не администратор.
-        Ответ: Page[BookRead] с пагинацией (limit/offset в query).
-        """
         params = {"limit": limit, "offset": offset}
         response = await self._request(
-            "POST",
-            "/admin/pending-reservations",
+            "POST", "/admin/pending-reservations",
             params=params,
-            json={"requester_id": requester_id}
+            json={"requester_id": requester_id},
         )
         return self._extract_items(response) if response else []
-
-    # =========================================
-    # MEDIA
-    # =========================================
-
-    async def get_image_bytes(self, image_path: str) -> Optional[bytes]:
-        """
-        Скачивает изображение из API по внутреннему пути (напр. 'books/uuid.webp').
-        image_path возвращается как есть из БД (без regex-валидации в v2).
-        """
-        session = await self._get_session()
-        url = f"{self.base_url}/media/{image_path}"
-        try:
-            async with session.get(url) as response:
-                if response.status == 200:
-                    return await response.read()
-                print(f"❌ Failed to get image: {response.status}")
-                return None
-        except Exception as e:
-            print(f"❌ Connection error to API: {e}")
-            return None
 
     # =========================================
     # HEALTH
     # =========================================
 
     async def health_check(self) -> Dict:
-        """
-        GET /health — единственный эндпоинт БЕЗ X-API-Token.
-        Теперь проверяет доступность БД.
-        HTTP 503 при недоступности: {"status": "unhealthy", "detail": "Database unavailable"}
-        HTTP 200 при норме:         {"status": "ok", "service": "Library API"}
-        """
-        # Делаем запрос без токена — временно создаём сессию без заголовка
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-            url = f"{self.base_url}/health"
-            try:
-                async with session.get(url) as response:
-                    data = await response.json()
-                    return data
-            except Exception as e:
-                print(f"❌ Health check error: {e}")
-                return {"status": "unknown"}
+        """Единственный эндпоинт без X-API-Token. Использует отдельную сессию."""
+        session = await self._get_health_session()
+        try:
+            async with session.get(f"{self.base_url}/health") as response:
+                return await response.json()
+        except asyncio.TimeoutError:
+            logger.error("Health check timeout")
+            return {"status": "timeout"}
+        except Exception as e:
+            logger.error("Health check error: %s", e)
+            return {"status": "unknown"}
 
 
 # Singleton
