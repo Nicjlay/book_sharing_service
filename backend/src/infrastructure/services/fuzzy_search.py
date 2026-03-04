@@ -25,7 +25,7 @@ import unicodedata
 def _normalize(text: str) -> str:
     """Приводим к нижнему регистру, убираем диакритику и лишние символы."""
     text = text.lower().strip()
-    text = unicodedata.normalize("NFKD", text)
+    text = unicodedata.normalize("NFC", text)
     text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
     text = re.sub(r"\s+", " ", text).strip()
     return text

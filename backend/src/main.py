@@ -466,7 +466,6 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 
 MEDIA_ROOT      = Path(os.getenv("MEDIA_UPLOAD_DIR", "/app/media"))
 BOOKS_MEDIA_DIR = MEDIA_ROOT / "books"
-BOOKS_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_IMAGE_PATH = BOOKS_MEDIA_DIR / "base_cover.jpg"
 if not DEFAULT_IMAGE_PATH.exists():
@@ -586,7 +585,7 @@ async def auth_user(
 @protected.get("/users", response_model=Page[UserRead])
 async def search_users_endpoint(
     q:      Optional[str] = None,
-    limit:  int = Query(default=50, ge=1, le=200),
+    limit:  int = Query(default=100, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
 ):

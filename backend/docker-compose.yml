@@ -3,29 +3,14 @@
     build:
       dockerfile: Dockerfile
     container_name: library_api
+    env_file: .env
     ports:
       - "${APP_PORT:-8000}:8000"
     volumes:
-      - ./src:/app        # для разработки; при необходимости можно вынести в .env
+      - ./src:/app
       - ./media:/app/media
-    environment:
-      - MODE=${MODE}
-      # Для сборки DATABASE_URL используем переменные из .env
-      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
-      # Остальные переменные для приложения
-      - API_TOKEN=${API_TOKEN}
-      - BOT_WEBHOOK_URL=${BOT_WEBHOOK_URL}
-      - ADMIN_USER_IDS=${ADMIN_USER_IDS}
-      - MEDIA_UPLOAD_DIR=${MEDIA_UPLOAD_DIR}
-      - APP_HOST=${APP_HOST}
-      - APP_PORT=${APP_PORT}
     networks:
       - library_network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:${APP_PORT:-8000}/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
     depends_on:
       - db
     restart: unless-stopped
@@ -41,6 +26,7 @@
       - postgres_data:/var/lib/postgresql/data
     networks:
       - library_network
+    restart: unless-stopped
 
 networks:
   library_network:

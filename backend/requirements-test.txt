@@ -1,0 +1,5 @@
+# Запуск: pip install -r requirements-test.txt
+pytest==8.3.5
+pytest-asyncio==0.24.0   # async/await тесты
+httpx==0.28.1            # тестовый HTTP-клиент для FastAPI
+pytest-mock==3.14.0      # удобный mocker-фикстурой
