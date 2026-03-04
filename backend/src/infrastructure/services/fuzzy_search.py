@@ -25,9 +25,7 @@ import unicodedata
 def _normalize(text: str) -> str:
     """Приводим к нижнему регистру, убираем диакритику и лишние символы."""
     text = text.lower().strip()
-    # Нормализация unicode (ё → е и т.п. для надёжности)
     text = unicodedata.normalize("NFKD", text)
-    # Оставляем только буквы, цифры и пробелы
     text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
     text = re.sub(r"\s+", " ", text).strip()
     return text
@@ -164,7 +162,6 @@ def did_you_mean(query: str, books: List[Dict]) -> str | None:
     if not results:
         return None
     best_book, best_score = results[0]
-    # Предлагаем подсказку только если нет явно хорошего совпадения
     if 0.10 <= best_score < 0.35:
         return best_book.get("title") or best_book.get("author")
     return None

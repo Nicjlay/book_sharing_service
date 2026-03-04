@@ -84,7 +84,9 @@ async def show_admin_panel(event: Message | CallbackQuery, **kwargs):
 async def show_pending_reservations(callback: CallbackQuery, state: FSMContext, **kwargs):
     """Показать заявки на бронирование (ТЗ 3.2.3)"""
     try:
-        books = await api.get_pending_reservations()
+        # ИЗМЕНЕНИЕ v2: метод стал POST, требует requester_id для авторизации
+        requester_id = callback.from_user.id
+        books = await api.get_pending_reservations(requester_id=requester_id)
 
         if not books:
             await safe_edit_message(
@@ -95,14 +97,17 @@ async def show_pending_reservations(callback: CallbackQuery, state: FSMContext, 
             await callback.answer()
             return
 
-        # Храним только id'шники — не кладём все данные книг в память FSM
         book_ids = [b["id"] for b in books]
         await state.update_data(pending_book_ids=book_ids, pending_books_cache=books, current_pending_index=0)
         await show_reservation_request(callback.message, books[0], 0, len(books))
         await callback.answer()
 
     except Exception as e:
-        await callback.answer("Ошибка загрузки заявок", show_alert=True)
+        error_msg = str(e)
+        if "403" in error_msg:
+            await callback.answer("❌ Нет прав администратора", show_alert=True)
+        else:
+            await callback.answer("Ошибка загрузки заявок", show_alert=True)
         print(f"Error loading pending reservations: {e}")
 
 
@@ -111,7 +116,6 @@ async def show_reservation_request(message: Message, book: dict, index: int, tot
     from aiogram.utils.keyboard import InlineKeyboardBuilder
     from aiogram.types import InlineKeyboardButton
 
-    # Кликабельный юзер заёмщика
     borrower_id = book.get("borrower_id")
     borrower_username = book.get("borrower_username")
     borrower_full_name = book.get("borrower_full_name", "Неизвестен")
@@ -195,6 +199,7 @@ async def approve_reservation(callback: CallbackQuery, state: FSMContext):
     from aiogram.types import InlineKeyboardButton
 
     builder = InlineKeyboardBuilder()
+    # ИЗМЕНЕНИЕ v2: due_date должна быть в будущем и не далее 730 дней
     dates = [(7, "+1 неделя"), (14, "+2 недели"), (21, "+3 недели"), (30, "+1 месяц")]
     for days, label in dates:
         due_date = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
@@ -205,7 +210,6 @@ async def approve_reservation(callback: CallbackQuery, state: FSMContext):
         ))
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="admin_reservations"))
 
-    # Если сообщение с фото — удаляем и шлём новое
     try:
         await callback.message.delete()
     except Exception:
@@ -232,6 +236,7 @@ async def set_due_date_and_approve(callback: CallbackQuery, state: FSMContext):
 
     try:
         due_date = datetime.strptime(due_date_str, "%Y-%m-%d")
+        # ИЗМЕНЕНИЕ v2: due_date передаётся как ISO-строка, сервер проверяет диапазон
         book = await api.approve_reservation(book_id, admin_id, due_date.isoformat())
         await state.clear()
 
@@ -244,10 +249,14 @@ async def set_due_date_and_approve(callback: CallbackQuery, state: FSMContext):
         )
 
     except Exception as e:
-        await _go_admin(
-            callback.message,
-            "❌ Ошибка подтверждения выдачи. Попробуйте ещё раз."
-        )
+        error_msg = str(e)
+        if "422" in error_msg:
+            text = "❌ Некорректная дата возврата. Дата должна быть в будущем и не позже 730 дней."
+        elif "403" in error_msg:
+            text = "❌ Нет прав администратора."
+        else:
+            text = "❌ Ошибка подтверждения выдачи. Попробуйте ещё раз."
+        await _go_admin(callback.message, text)
         print(f"Error approving reservation: {e}")
 
 
@@ -263,7 +272,6 @@ async def reject_reservation(callback: CallbackQuery, state: FSMContext):
     await state.update_data(reject_book_id=book_id)
     await state.set_state(AdminRejectStates.reason)
 
-    # Если сообщение с фото — удаляем
     try:
         await callback.message.delete()
     except Exception:
@@ -286,6 +294,11 @@ async def process_reject_reason(message: Message, state: FSMContext):
 
     if len(reason) < 3:
         await message.answer("❌ Причина слишком короткая. Введите минимум 3 символа.")
+        return
+
+    # ИЗМЕНЕНИЕ v2: reason max_length=500
+    if len(reason) > 500:
+        await message.answer("❌ Причина слишком длинная. Максимум 500 символов.")
         return
 
     data = await state.get_data()
@@ -316,9 +329,14 @@ async def process_reject_reason(message: Message, state: FSMContext):
             await loading.delete()
         except Exception:
             pass
-        await message.answer(
-            "❌ Ошибка отклонения заявки. Попробуйте ещё раз.",
-            reply_markup=admin_panel_keyboard(),
-            parse_mode="HTML"
-        )
+
+        error_msg = str(e)
+        if "400" in error_msg:
+            text = "❌ Книга не в статусе ожидания. Возможно, заявка уже обработана."
+        elif "403" in error_msg:
+            text = "❌ Нет прав администратора."
+        else:
+            text = "❌ Ошибка отклонения заявки. Попробуйте ещё раз."
+
+        await message.answer(text, reply_markup=admin_panel_keyboard(), parse_mode="HTML")
         print(f"Error rejecting reservation: {e}")

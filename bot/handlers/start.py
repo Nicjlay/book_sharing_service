@@ -21,27 +21,23 @@ async def cmd_start(message: Message, state: FSMContext):
     Обработка команды /start
     Регистрация/авторизация пользователя в системе
     """
-    # Очищаем состояние на всякий случай
     await state.clear()
 
-    # Авторизация пользователя в API
     user_id = message.from_user.id
     full_name = message.from_user.full_name
     username = message.from_user.username
 
-    # Проверяем, является ли пользователь админом
     is_admin = user_id in settings.admin_ids_list
 
     try:
-        # Регистрируем/обновляем пользователя в API
+        # ИЗМЕНЕНИЕ v2: is_admin удалён из запроса POST /users/auth.
+        # Управление правами теперь через отдельный эндпоинт POST /users/{tg_id}/set-admin.
         await api.auth_user(
             tg_id=user_id,
             full_name=full_name,
             username=username,
-            is_admin=int(is_admin)
         )
 
-        # Приветственное сообщение
         welcome_text = (
             f"👋 Привет, {full_name}!\n\n"
             f"📚 Добро пожаловать в <b>Библиотеку</b> — бот для обмена и учёта книг.\n\n"
@@ -78,9 +74,7 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @router.message(Command("menu"))
 async def cmd_menu(message: Message, state: FSMContext):
-    """
-    Команда /menu - вернуться в главное меню
-    """
+    """Команда /menu - вернуться в главное меню"""
     await state.clear()
 
     user_id = message.from_user.id

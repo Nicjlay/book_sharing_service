@@ -1,7 +1,5 @@
 from pydantic_settings import BaseSettings
 from typing import List
-import os
-
 
 class Settings(BaseSettings):
     """
@@ -20,9 +18,6 @@ class Settings(BaseSettings):
 
     # Admin Users
     admin_user_ids: str = ""  # Comma-separated Telegram IDs
-
-    # Media
-    media_upload_dir: str = "media/books"
 
     # Application
     app_host: str = "0.0.0.0"
@@ -48,6 +43,3 @@ class Settings(BaseSettings):
 
 # Singleton instance
 settings = Settings()
-
-# Создаем директорию для медиа файлов
-os.makedirs(settings.media_upload_dir, exist_ok=True)

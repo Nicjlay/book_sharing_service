@@ -26,11 +26,7 @@ async def _go_home(message: Message, user_id: int, text: str):
         await message.delete()
     except Exception:
         pass
-    await message.answer(
-        text,
-        reply_markup=main_menu_keyboard(is_admin),
-        parse_mode="HTML"
-    )
+    await message.answer(text, reply_markup=main_menu_keyboard(is_admin), parse_mode="HTML")
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +49,6 @@ async def start_reservation(callback: CallbackQuery, state: FSMContext):
             await callback.answer("Книга уже занята", show_alert=True)
             return
 
-        # Владелец не может бронировать свою книгу
         if book.get("owner_id") == user_id:
             await callback.answer("Нельзя забронировать собственную книгу", show_alert=True)
             return
@@ -66,7 +61,7 @@ async def start_reservation(callback: CallbackQuery, state: FSMContext):
             f"📖 <b>{book['title']}</b>\n"
             f"✍️ {book['author']}\n\n"
             f"📅 <b>Выберите срок бронирования:</b>\n\n"
-            f"На какой срок вы хотите взять книгу?",
+            f"На какой срок вы хотите взять книгу? (1–90 дней)",
             reply_markup=reservation_days_keyboard()
         )
         await callback.answer()
@@ -84,7 +79,7 @@ async def select_reservation_days(callback: CallbackQuery, state: FSMContext):
     if days_str == "custom":
         await safe_edit_message(
             callback.message,
-            "✏️ Введите количество дней (1-90):",
+            "✏️ Введите количество дней (1–90):",
             reply_markup=cancel_keyboard()
         )
         await state.set_state(ReservationStates.custom_days)
@@ -98,6 +93,7 @@ async def select_reservation_days(callback: CallbackQuery, state: FSMContext):
 @router.message(ReservationStates.custom_days)
 async def process_custom_days(message: Message, state: FSMContext):
     """Обработка ввода произвольного срока"""
+    # ИЗМЕНЕНИЕ v2: days ge=1, le=90 (валидатор уже проверяет это)
     is_valid, days, error_msg = validate_days(message.text)
 
     if not is_valid:
@@ -108,7 +104,6 @@ async def process_custom_days(message: Message, state: FSMContext):
     book_id = data.get("reserve_book_id")
     user_id = message.from_user.id
 
-    # Индикатор загрузки
     loading = await message.answer("⏳ Отправляем запрос...")
 
     try:
@@ -137,19 +132,27 @@ async def process_custom_days(message: Message, state: FSMContext):
         except Exception:
             pass
 
-        if "409" in str(e) or "занята" in str(e).lower():
-            await message.answer(
-                "❌ <b>Книга уже забронирована</b>\n\n"
-                "Хотите встать в лист ожидания?",
-                reply_markup=main_menu_keyboard(user_id in settings.admin_ids_list),
-                parse_mode="HTML"
-            )
+        error_msg = str(e)
+        user_id = message.from_user.id
+        is_admin = user_id in settings.admin_ids_list
+
+        # ИЗМЕНЕНИЕ v2: новая 409 при превышении лимита одновременных книг
+        if "409" in error_msg:
+            if "5 книг" in error_msg or "более 5" in error_msg:
+                text = (
+                    "❌ <b>Превышен лимит книг</b>\n\n"
+                    "Нельзя иметь более 5 книг одновременно.\n"
+                    "Верните уже взятые книги."
+                )
+            else:
+                text = (
+                    "❌ <b>Книга уже забронирована</b>\n\n"
+                    "Хотите встать в лист ожидания?"
+                )
         else:
-            await message.answer(
-                "❌ Ошибка бронирования. Попробуйте позже.",
-                reply_markup=main_menu_keyboard(user_id in settings.admin_ids_list),
-                parse_mode="HTML"
-            )
+            text = "❌ Ошибка бронирования. Попробуйте позже."
+
+        await message.answer(text, reply_markup=main_menu_keyboard(is_admin), parse_mode="HTML")
         print(f"Error in reservation: {e}")
 
 
@@ -159,7 +162,6 @@ async def _process_reservation(callback: CallbackQuery, state: FSMContext, days:
     book_id = data.get("reserve_book_id")
     user_id = callback.from_user.id
 
-    # Показываем индикатор загрузки
     await safe_edit_message(callback.message, "⏳ Отправляем запрос...")
     await callback.answer()
 
@@ -178,19 +180,24 @@ async def _process_reservation(callback: CallbackQuery, state: FSMContext, days:
         )
 
     except Exception as e:
-        if "409" in str(e) or "занята" in str(e).lower():
-            await _go_home(
-                callback.message,
-                user_id,
-                "❌ <b>Книга уже забронирована кем-то другим.</b>\n\n"
-                "Вы можете встать в лист ожидания через каталог."
-            )
+        error_msg = str(e)
+        # ИЗМЕНЕНИЕ v2: новая 409 при превышении лимита одновременных книг (>5)
+        if "409" in error_msg:
+            if "5 книг" in error_msg or "более 5" in error_msg:
+                text = (
+                    "❌ <b>Превышен лимит книг</b>\n\n"
+                    "Нельзя иметь более 5 книг одновременно.\n"
+                    "Верните уже взятые книги."
+                )
+            else:
+                text = (
+                    "❌ <b>Книга уже забронирована кем-то другим.</b>\n\n"
+                    "Вы можете встать в лист ожидания через каталог."
+                )
         else:
-            await _go_home(
-                callback.message,
-                user_id,
-                "❌ Ошибка бронирования. Попробуйте позже."
-            )
+            text = "❌ Ошибка бронирования. Попробуйте позже."
+
+        await _go_home(callback.message, user_id, text)
         print(f"Error in reservation: {e}")
 
 
@@ -207,17 +214,58 @@ async def join_waitlist(callback: CallbackQuery):
     await callback.answer("⏳ Добавляем в список...")
 
     try:
-        await api.join_waitlist(book_id, user_id)
+        # ИЗМЕНЕНИЕ v2: user_id теперь в JSON-теле, не query-параметр
+        # Новый формат ответа: {"message": "...", "added": true/false}
+        result = await api.join_waitlist(book_id, user_id)
+
+        if result.get("added") is False:
+            # Уже в очереди — не ошибка
+            await _go_home(
+                callback.message,
+                user_id,
+                "ℹ️ <b>Вы уже в листе ожидания</b>\n\n"
+                "Когда книга освободится, вы получите уведомление."
+            )
+        else:
+            await _go_home(
+                callback.message,
+                user_id,
+                "🔔 <b>Вы добавлены в лист ожидания!</b>\n\n"
+                "Когда книга освободится, вы получите уведомление.\n\n"
+                "💡 Успейте первым забронировать её!"
+            )
+
+    except Exception as e:
+        error_msg = str(e)
+        if "400" in error_msg:
+            if "свою" in error_msg.lower() or "owner" in error_msg.lower():
+                text = "❌ Нельзя встать в очередь на свою книгу."
+            elif "держите" in error_msg.lower() or "borrower" in error_msg.lower():
+                text = "❌ Нельзя встать в очередь на книгу, которую держите."
+            else:
+                text = "❌ Ошибка добавления в лист ожидания."
+            await _go_home(callback.message, user_id, text)
+        else:
+            await callback.answer("Ошибка добавления в лист ожидания", show_alert=True)
+        print(f"Error joining waitlist: {e}")
+
+
+@router.callback_query(F.data.startswith("leave_waitlist:"))
+async def leave_waitlist(callback: CallbackQuery):
+    """НОВЫЙ v2: Покинуть лист ожидания"""
+    book_id = int(callback.data.split(":")[1])
+    user_id = callback.from_user.id
+
+    try:
+        await api.leave_waitlist(book_id, user_id)
         await _go_home(
             callback.message,
             user_id,
-            "🔔 <b>Вы добавлены в лист ожидания!</b>\n\n"
-            "Когда книга освободится, вы получите уведомление.\n\n"
-            "💡 Успейте первым забронировать её!"
+            "✅ Вы покинули лист ожидания."
         )
     except Exception as e:
-        await callback.answer("Ошибка добавления в лист ожидания", show_alert=True)
-        print(f"Error joining waitlist: {e}")
+        await callback.answer("Ошибка", show_alert=True)
+        print(f"Error leaving waitlist: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +285,6 @@ async def start_return_book(callback: CallbackQuery, state: FSMContext):
             await callback.answer("Книга не найдена", show_alert=True)
             return
 
-        # users.id = Telegram ID в этой схеме
         is_borrower = book.get("borrower_id") == user_id
         is_owner = book.get("owner_id") == user_id
 
@@ -248,7 +295,6 @@ async def start_return_book(callback: CallbackQuery, state: FSMContext):
         await state.update_data(return_book_id=book_id)
         await state.set_state(ReturnBookStates.upload_photo)
 
-        # Если сообщение с фото — сначала удаляем
         try:
             await callback.message.delete()
         except Exception:
@@ -302,13 +348,17 @@ async def invalid_return_photo(message: Message):
 
 
 async def _do_return(message: Message, user_id: int, state: FSMContext, photo_data: bytes = None):
-    """Выполняет возврат книги через API"""
+    """
+    Выполняет возврат книги через API.
+    КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ v2: is_admin удалён из FormData.
+    Сервер определяет права по admin-флагу пользователя в БД.
+    Ответ: {"status": "returned"}
+    """
     data = await state.get_data()
     book_id = data.get("return_book_id")
-    is_admin = user_id in settings.admin_ids_list
 
     try:
-        await api.return_book(book_id, user_id, is_admin, photo_data)
+        await api.return_book(book_id, user_id, photo_bytes=photo_data)
         await state.clear()
         await _go_home(
             message,
