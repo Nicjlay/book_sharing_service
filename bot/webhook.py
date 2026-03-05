@@ -239,62 +239,77 @@ async def _send_to_user(
 
 @app.post(settings.webhook_path)
 async def receive_notification(
-    request: Request,
-    # FIX: Optional[str] вместо str — если заголовок отсутствует, FastAPI
-    # устанавливает None, а не вызывает ошибку валидации 422.
-    # С аннотацией str = Header(None) в strict-режиме pydantic v2 / некоторых
-    # версиях FastAPI возникает ValidationError вместо корректного 401.
-    x_api_token: Optional[str] = Header(None),
+        request: Request,
+        x_api_token: Optional[str] = Header(None),
 ):
     """
-    Приём уведомлений от API (push-архитектура).
-
-    Маршрут берётся из settings.webhook_path — ранее был захардкожен "/webhook",
-    что не соответствовало настройке при изменении переменной окружения.
+    Приём уведомлений от API (push-архитектура) с поддержкой бэкапов БД.
     """
 
-    # Защита от payload-flooding: проверяем размер тела до парсинга.
-    content_length = request.headers.get("content-length")
-    if content_length:
-        try:
-            if int(content_length) > _MAX_PAYLOAD_BYTES:
-                raise HTTPException(status_code=413, detail="Payload too large")
-        except ValueError:
-            pass  # Некорректный заголовок — дополнительная проверка после чтения тела
-
-    # secrets.compare_digest — timing-safe сравнение токенов.
-    # Проверяем до чтения тела: экономим ресурсы при неавторизованных запросах.
+    # 1. Проверка токена (Timing-safe) до чтения тела
     if not x_api_token or not secrets.compare_digest(
-        x_api_token.encode(), settings.api_token.encode()
+            x_api_token.encode(), settings.api_token.encode()
     ):
         raise HTTPException(status_code=401, detail="Invalid API token")
 
     if not bot:
         raise HTTPException(status_code=500, detail="Bot not initialized")
 
-    # Парсим тело вручную (уже прошли size check по заголовку,
-    # повторная проверка по реальному размеру защищает от подмены Content-Length)
+    # 2. Определяем тип контента и парсим данные
+    content_type = request.headers.get("content-type", "")
+    backup_file_content: Optional[bytes] = None
+    filename: str = "backup.sql"
+
     try:
-        body = await request.body()
-        if len(body) > _MAX_PAYLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="Payload too large")
-        payload = NotificationPayload(**json.loads(body))
+        if "multipart/form-data" in content_type:
+            # Для бэкапов (используем лимит побольше, если это файл, или оставляем базовый)
+            form = await request.form()
+            payload_json = form.get("payload")
+            if not payload_json:
+                raise HTTPException(status_code=422, detail="Missing payload in multipart")
+
+            payload = NotificationPayload(**json.loads(str(payload_json)))
+
+            # Извлекаем файл бэкапа
+            upload_file = form.get("backup_file")
+            if upload_file and hasattr(upload_file, "read"):
+                backup_file_content = await upload_file.read()
+                filename = getattr(upload_file, "filename", filename)
+        else:
+            # Стандартный путь для JSON-уведомлений
+            body = await request.body()
+            if len(body) > _MAX_PAYLOAD_BYTES:
+                raise HTTPException(status_code=413, detail="Payload too large")
+            payload = NotificationPayload(**json.loads(body))
+
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Invalid payload: {e}") from e
 
+    # 3. Обработка и отправка
     try:
         notification_text = format_notification(payload.model_dump())
-        photo_path = payload.meta.get("photo_path") if payload.meta else None
 
+        # СПЕЦИАЛЬНАЯ ЛОГИКА ДЛЯ БЭКАПА
+        if payload.type == "database_backup" and backup_file_content:
+            tg_file = BufferedInputFile(backup_file_content, filename=filename)
+            await bot.send_document(
+                chat_id=payload.user_id,
+                document=tg_file,
+                caption=notification_text,
+                parse_mode="HTML"
+            )
+            return {"status": "ok"}
+
+        # СТАНДАРТНАЯ ЛОГИКА (из твоего исходного кода)
+        photo_path = payload.meta.get("photo_path") if payload.meta else None
         keyboard = None
         if payload.type == "admin_reservation_request" and payload.book_id:
             keyboard = _make_reservation_keyboard(payload.book_id)
 
+        # Рассылка (Админы/Группа/Юзер)
         if payload.user_id == -1:
-            # Параллельная рассылка всем администраторам.
-            # Один недоступный пользователь не блокирует доставку остальным.
             admin_ids = list(settings.admin_ids_set)
             if admin_ids:
                 results = await asyncio.gather(
@@ -321,26 +336,14 @@ async def receive_notification(
                     )
                 except Exception as e:
                     logger.error("Failed to send to group %d: %s", group_id, e)
-            else:
-                logger.debug(
-                    "Notification type=%s targeted group (user_id=0) "
-                    "but group_chat_id is not configured — skipped",
-                    payload.type,
-                )
-
         else:
-            try:
-                await _send_to_user(
-                    payload.user_id, notification_text,
-                    photo_path=photo_path, reply_markup=keyboard,
-                )
-            except Exception as e:
-                logger.error("Failed to send to user %d: %s", payload.user_id, e)
+            await _send_to_user(
+                payload.user_id, notification_text,
+                photo_path=photo_path, reply_markup=keyboard,
+            )
 
         return {"status": "ok"}
 
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error("Error processing notification: %s", e)
         raise HTTPException(status_code=500, detail="Internal server error")

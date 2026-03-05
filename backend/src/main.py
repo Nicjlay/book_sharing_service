@@ -1,10 +1,12 @@
 import asyncio
 import contextvars
+import json
 import logging
 import logging.config
 import os
 import re
 import secrets
+import subprocess
 import time
 import uuid
 from collections import deque
@@ -13,6 +15,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Deque, Dict, List, Optional, Set
 
+import httpx
 from dotenv import load_dotenv
 from fastapi import (
     FastAPI, Depends, HTTPException, UploadFile, File,
@@ -937,6 +940,75 @@ async def get_pending_reservations(
     return Page(items=items, total=total, limit=limit, offset=offset)
 
 
+@protected.post("/admin/send-backup", response_model=StatusResponse)
+async def trigger_backup_to_admin(
+        payload: PendingReservationsRequest = Body(...),
+        db: AsyncSession = Depends(get_db)
+):
+    """
+    Создает бэкап БД и отправляет его админу через Webhook бота.
+    """
+    # 1. Проверка прав (как в твоих других методах)
+    user_repo = UserRepository(db)
+    if not await user_repo.is_admin(payload.requester_id):
+        raise HTTPException(status_code=403, detail="Доступ запрещен")
+
+    # 2. Настройки БД (подставь свои, если они отличаются)
+    db_user = os.getenv("POSTGRES_USER", "Nikolay")
+    db_name = os.getenv("POSTGRES_DB", "library_db")
+    db_host = "db"
+    filename = f"backup_{db_name}_{int(time.time())}.sql"
+
+    try:
+        # 3. Генерация дампа через pg_dump
+        # Мы используем asyncio, чтобы не блокировать основной поток API
+        process = await asyncio.create_subprocess_exec(
+            "pg_dump", "-U", db_user, "-h", db_host, db_name,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+
+        if process.returncode != 0:
+            logger.error("pg_dump error: %s", stderr.decode())
+            raise HTTPException(status_code=500, detail="Ошибка при создании дампа базы")
+
+        # 4. ФОРМИРОВАНИЕ ПРАВИЛЬНОГО ЗАПРОСА (Multipart)
+        # Данные уведомления упаковываем в JSON-строку внутри формы
+        notification_data = {
+            "user_id": payload.requester_id,
+            "type": "database_backup",
+            "message": f"📦 Еженедельный бэкап базы данных\nФайл: {filename}",
+            "meta": {"filename": filename}
+        }
+
+        # Подготавливаем файлы для отправки
+        # 'payload' идет как текстовое поле, 'backup_file' как файл
+        files = {
+            "backup_file": (filename, stdout, "application/sql"),
+            "payload": (None, json.dumps(notification_data), "application/json")
+        }
+
+        # Отправляем боту
+        bot_webhook_url = f"http://bot:8001{os.getenv('WEBHOOK_PATH', '/webhook')}"
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                bot_webhook_url,
+                headers={"X-API-Token": API_TOKEN},  # Используем твой константный токен
+                files=files,
+                timeout=60.0  # Бэкап может быть тяжелым, даем время
+            )
+
+        if response.status_code != 200:
+            logger.error("Bot webhook failed: %s", response.text)
+            raise HTTPException(status_code=500, detail="Бот не смог принять файл")
+
+        return {"status": "backup_sent_to_telegram"}
+
+    except Exception as e:
+        logger.error("Backup system error: %s", e)
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 # ---------------------------------------------------------------------------
 # Подключаем роутеры
 # ---------------------------------------------------------------------------

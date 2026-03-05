@@ -13,7 +13,7 @@ services:
     depends_on:
       - db
     volumes:
-      - media_storage:/app/media
+      - ./backend/media:/app/media
 
   bot:
     build: ./bot
@@ -22,7 +22,7 @@ services:
     depends_on:
       - api
     volumes:
-      - media_storage:/app/media
+      - ./backend/media:/app/media
 
   gateway:
     image: nginx:alpine
