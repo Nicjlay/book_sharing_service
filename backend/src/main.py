@@ -964,7 +964,7 @@ async def trigger_backup_to_admin(
     # Копируем текущие переменные окружения системы и добавляем туда пароль для Postgres
     env = os.environ.copy()
     env["PGPASSWORD"] = db_password
-    
+
     try:
         # 3. Генерация дампа через pg_dump
         # Мы используем asyncio, чтобы не блокировать основной поток API
