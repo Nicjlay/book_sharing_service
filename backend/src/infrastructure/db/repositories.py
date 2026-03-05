@@ -554,7 +554,7 @@ class BookRepository:
             result = await self.session.execute(query)
             genres = [g for g in result.scalars().all() if g]
 
-            defaults   = ["Роман", "Фантастика", "Non-fiction", "Бизнес", "Психология", "Другое"]
+            defaults   = ["Семейная", "До Крещения", "После крещения", "Историческая"]
             all_genres = list(dict.fromkeys(defaults + genres))
 
             _genres_cache    = all_genres
