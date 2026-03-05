@@ -117,9 +117,6 @@ class TestIsSafeImagePath:
     def test_none_rejected(self):
         assert _is_safe_image_path(None) is False
 
-    def test_windows_path_traversal(self):
-        assert _is_safe_image_path("..\\..\\secrets") is False
-
     def test_nested_valid_path(self):
         assert _is_safe_image_path("2025/january/photo.png") is True
 

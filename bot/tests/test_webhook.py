@@ -1,238 +1,208 @@
 """
-test_telegram_utils.py — тесты для utils/telegram.py
+test_webhook.py — тесты для webhook.py (FastAPI эндпоинты)
 
-Здесь смешаны:
-1. Чистые функции (_safe_html_truncate, _is_safe_image_path) — тестируются напрямую
-2. Async функции (safe_edit_message, safe_delete_message) — используем pytest-asyncio
-   и mock объекты вместо настоящего Telegram
+FastAPI предоставляет TestClient — синхронный HTTP-клиент для тестирования
+без запуска реального сервера. Мы делаем HTTP-запросы к нашему приложению
+прямо в памяти, без сети.
 
-ПОЧЕМУ МЫ МОКАЕМ (подменяем) ОБЪЕКТЫ?
-Настоящий Telegram-бот требует интернета, токена и реального чата.
-В тестах мы создаём "муляж" (Mock) объекта Message, который выглядит
-как настоящий, но на самом деле просто записывает какие методы вызывались.
+Что тестируем:
+1. /health — простой эндпоинт
+2. POST /webhook — авторизация, валидация, маршрутизация уведомлений
 
-Запуск:
-    pytest tests/test_telegram_utils.py -v
+ВАЖНО: bot-объект подменяется моком, чтобы реальные сообщения не отправлялись.
 """
+import json
 import pytest
-import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from utils.telegram import _safe_html_truncate, _is_safe_image_path, safe_edit_message, safe_delete_message
+from fastapi.testclient import TestClient
+
+VALID_TOKEN = "test-secret-token"
+HEADERS = {"X-API-Token": VALID_TOKEN}
 
 
-# ═══════════════════════════════════════════
-# _safe_html_truncate — чистая функция
-# ═══════════════════════════════════════════
+@pytest.fixture
+def mock_bot_instance():
+    """Мок объекта aiogram Bot."""
+    bot = MagicMock()
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
+    bot.send_photo = AsyncMock(return_value=MagicMock(message_id=2))
+    return bot
 
-class TestSafeHtmlTruncate:
+
+@pytest.fixture
+def client(mock_bot_instance):
     """
-    Проблема: Telegram не принимает сообщения с оборванными HTML-тегами.
-    Наивный text[:100] может обрезать «<b>Текст» до «<b>Те» — сломанный HTML.
-    Функция _safe_html_truncate решает эту проблему.
+    FastAPI TestClient с инициализированным ботом.
+
+    ПРИЧИНА ОШИБКИ с 401: settings — это синглтон из config.py, созданный
+    при первом импорте модуля. Его поле api_token может содержать значение
+    из настоящего .env файла, а не "test-secret-token" из conftest.
+    os.environ.setdefault() не перезаписывает уже существующие переменные,
+    а pydantic-settings читает .env файл при создании Settings().
+
+    ФИКС: принудительно подменяем api_token через object.__setattr__,
+    который обходит pydantic-валидацию (она блокирует обычное присваивание).
+    Восстанавливаем оригинальное значение в finally.
     """
+    import webhook as wh
+    from config import settings
 
-    def test_short_text_unchanged(self):
-        text = "Короткий текст"
-        assert _safe_html_truncate(text, 100) == text
+    original_token = settings.api_token
+    # object.__setattr__ нужен потому что pydantic v2 по умолчанию
+    # запрещает прямое присваивание полей через model.__setattr__
+    object.__setattr__(settings, "api_token", VALID_TOKEN)
 
-    def test_truncates_plain_text(self):
-        text = "A" * 50
-        result = _safe_html_truncate(text, 20)
-        assert len(result) <= 20
-        assert result.endswith("…")
+    wh.set_bot(mock_bot_instance)
+    try:
+        with patch.object(wh, "_fetch_photo", new=AsyncMock(return_value=None)):
+            yield TestClient(wh.app)
+    finally:
+        object.__setattr__(settings, "api_token", original_token)
 
-    def test_removes_incomplete_tag_at_end(self):
-        # Если обрезка попадает в середину тега "<b>" — он удаляется
-        text = "Normal text <b>bold"
-        result = _safe_html_truncate(text, 15)
-        # Незакрытый "<b" на конце не должен остаться
-        assert not result.endswith("<")
-        assert "<b" not in result or result.count("<b") < text.count("<b")
 
-    def test_exactly_at_limit_no_truncation(self):
-        text = "А" * 10
-        result = _safe_html_truncate(text, 10)
-        assert result == text
-
-    def test_one_over_limit_truncates(self):
-        text = "А" * 11
-        result = _safe_html_truncate(text, 10)
-        assert len(result) < 11
-        assert "…" in result
-
-    def test_custom_suffix(self):
-        text = "Hello World"
-        result = _safe_html_truncate(text, 8, suffix="...")
-        assert result.endswith("...")
-
-    def test_incomplete_tag_cleaned(self):
-        # Текст заканчивается открытым тегом — он должен быть убран
-        text = "Текст <b"  # незакрытый тег
-        result = _safe_html_truncate(text, 1024)  # не обрезаем, но текст уже "сломан"
-        # Если длина <= max_len — возвращаем как есть (функция не исправляет уже короткие строки)
-        assert isinstance(result, str)
+def make_payload(**kwargs) -> dict:
+    """Базовый валидный payload уведомления."""
+    base = {"user_id": 123, "type": "new_book", "message": "Новая книга добавлена!"}
+    base.update(kwargs)
+    return base
 
 
 # ═══════════════════════════════════════════
-# _is_safe_image_path — чистая функция
+# /health
 # ═══════════════════════════════════════════
 
-class TestIsSafeImagePath:
-    """
-    Защита от Path Traversal атаки.
-    Атакующий пытается передать путь типа "../../../etc/passwd",
-    чтобы прочитать файлы за пределами разрешённой директории.
-    """
+class TestHealthEndpoint:
+    def test_health_returns_ok(self, client):
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert "bot_initialized" in data
 
-    # ПРИЧИНА ОШИБКИ: функция _is_safe_image_path использует MEDIA_ROOT = "/app/media".
-    # На Windows os.path.abspath("/app/media") → "C:\app\media" (добавляет букву диска),
-    # а os.path.join("/app/media", "covers/book42.jpg") → "\app\media\covers\book42.jpg"
-    # (без буквы диска). Проверка startswith("C:\app\media\") проваливается.
-    #
-    # ФИКС: подменяем MEDIA_ROOT на реальный абсолютный путь текущей системы
-    # через patch. os.path.abspath(".") всегда возвращает корректный путь на любой ОС.
-
-    @pytest.fixture(autouse=True)
-    def patch_media_root(self, tmp_path):
-        """Заменяем MEDIA_ROOT на временную директорию pytest для каждого теста."""
-        with patch("utils.telegram.MEDIA_ROOT", str(tmp_path)):
-            yield
-
-    def test_valid_simple_path(self):
-        assert _is_safe_image_path("covers/book42.jpg") is True
-
-    def test_valid_just_filename(self):
-        assert _is_safe_image_path("photo.jpg") is True
-
-    def test_path_traversal_rejected(self):
-        assert _is_safe_image_path("../../../etc/passwd") is False
-
-    def test_absolute_path_rejected(self):
-        assert _is_safe_image_path("/etc/passwd") is False
-
-    def test_empty_string_rejected(self):
-        assert _is_safe_image_path("") is False
-
-    def test_none_rejected(self):
-        assert _is_safe_image_path(None) is False
-
-    def test_windows_path_traversal(self):
-        assert _is_safe_image_path("..\\..\\secrets") is False
-
-    def test_nested_valid_path(self):
-        assert _is_safe_image_path("2025/january/photo.png") is True
+    def test_health_bot_initialized_true(self, client):
+        resp = client.get("/health")
+        assert resp.json()["bot_initialized"] is True
 
 
 # ═══════════════════════════════════════════
-# safe_edit_message — async с моком
+# POST /webhook — авторизация
 # ═══════════════════════════════════════════
 
-@pytest.mark.asyncio
-class TestSafeEditMessage:
-    """
-    safe_edit_message — умная обёртка вокруг Telegram API.
-    Telegram хранит photo-сообщения иначе, чем текстовые:
-    у фото нет поля 'text', только 'caption'.
-    Функция автоматически выбирает нужный метод.
-    """
-
-    async def test_edits_text_message(self, mock_message):
-        mock_message.photo = None
-        await safe_edit_message(mock_message, "Новый текст")
-        mock_message.edit_text.assert_called_once()
-        args = mock_message.edit_text.call_args
-        assert "Новый текст" in args[0] or args[1].get("text", "")  # позиционный или именной
-
-    async def test_edits_photo_caption(self, mock_message):
-        # Если сообщение содержит фото — нужно вызывать edit_caption
-        mock_message.photo = [MagicMock()]  # непустой список = есть фото
-        await safe_edit_message(mock_message, "Подпись к фото")
-        mock_message.edit_caption.assert_called_once()
-        mock_message.edit_text.assert_not_called()
-
-    async def test_ignores_not_modified_error(self, mock_message):
-        from aiogram.exceptions import TelegramBadRequest
-        mock_message.photo = None
-        mock_message.edit_text.side_effect = TelegramBadRequest(
-            method=MagicMock(), message="message is not modified"
+class TestWebhookAuth:
+    def test_no_token_returns_401(self, client):
+        resp = client.post(
+            "/webhook",
+            json=make_payload(),
+            # Без заголовка X-API-Token
         )
-        # Не должно бросать исключение
-        await safe_edit_message(mock_message, "Тот же текст")
+        assert resp.status_code == 401
 
-    async def test_ignores_message_not_found(self, mock_message):
-        from aiogram.exceptions import TelegramBadRequest
-        mock_message.photo = None
-        mock_message.edit_text.side_effect = TelegramBadRequest(
-            method=MagicMock(), message="message to edit not found"
+    def test_wrong_token_returns_401(self, client):
+        resp = client.post(
+            "/webhook",
+            headers={"X-API-Token": "wrong-token"},
+            json=make_payload(),
         )
-        await safe_edit_message(mock_message, "Текст")  # не падает
+        assert resp.status_code == 401
 
-    async def test_reraises_unexpected_telegram_error(self, mock_message):
-        from aiogram.exceptions import TelegramBadRequest
-        mock_message.photo = None
-        mock_message.edit_text.side_effect = TelegramBadRequest(
-            method=MagicMock(), message="some unexpected error"
-        )
-        with pytest.raises(TelegramBadRequest):
-            await safe_edit_message(mock_message, "Текст")
-
-    async def test_truncates_long_text(self, mock_message):
-        """Текст длиннее 4096 символов должен быть обрезан."""
-        mock_message.photo = None
-        long_text = "А" * 5000
-        await safe_edit_message(mock_message, long_text)
-        called_text = mock_message.edit_text.call_args[0][0]
-        assert len(called_text) <= 4096
-
-    async def test_truncates_long_caption(self, mock_message):
-        """Caption длиннее 1024 символов должен быть обрезан."""
-        mock_message.photo = [MagicMock()]
-        long_text = "А" * 2000
-        await safe_edit_message(mock_message, long_text)
-        kwargs = mock_message.edit_caption.call_args[1]
-        assert len(kwargs["caption"]) <= 1024
-
-    async def test_passes_reply_markup(self, mock_message):
-        mock_message.photo = None
-        keyboard = MagicMock()
-        await safe_edit_message(mock_message, "Текст", reply_markup=keyboard)
-        kwargs = mock_message.edit_text.call_args[1]
-        assert kwargs["reply_markup"] is keyboard
+    def test_valid_token_accepted(self, client):
+        resp = client.post("/webhook", headers=HEADERS, json=make_payload())
+        assert resp.status_code == 200
 
 
 # ═══════════════════════════════════════════
-# safe_delete_message — async с моком
+# POST /webhook — валидация payload
 # ═══════════════════════════════════════════
 
-@pytest.mark.asyncio
-class TestSafeDeleteMessage:
-    async def test_deletes_message(self, mock_message):
-        await safe_delete_message(mock_message)
-        mock_message.delete.assert_called_once()
-
-    async def test_ignores_already_deleted(self, mock_message):
-        from aiogram.exceptions import TelegramBadRequest
-        mock_message.delete.side_effect = TelegramBadRequest(
-            method=MagicMock(), message="message to delete not found"
+class TestWebhookValidation:
+    def test_invalid_json_returns_422(self, client):
+        # ПРИЧИНА ОШИБКИ: в оригинале был несуществующий аргумент headers_extra.
+        # TestClient.post() принимает только headers= (один словарь).
+        # ФИКС: передаём Content-Type прямо в headers вместе с токеном.
+        resp = client.post(
+            "/webhook",
+            headers={**HEADERS, "Content-Type": "application/json"},
+            content=b"not valid json",
         )
-        await safe_delete_message(mock_message)  # не падает
+        assert resp.status_code in (400, 422)
 
-    async def test_ignores_cant_delete(self, mock_message):
-        from aiogram.exceptions import TelegramBadRequest
-        mock_message.delete.side_effect = TelegramBadRequest(
-            method=MagicMock(), message="message can't be deleted"
+    def test_missing_required_field_returns_422(self, client):
+        # type и message обязательны
+        resp = client.post(
+            "/webhook",
+            headers=HEADERS,
+            json={"user_id": 123},  # нет type и message
         )
-        await safe_delete_message(mock_message)  # не падает
+        assert resp.status_code == 422
 
-    async def test_logs_unexpected_bad_request(self, mock_message):
-        from aiogram.exceptions import TelegramBadRequest
-        mock_message.delete.side_effect = TelegramBadRequest(
-            method=MagicMock(), message="some other weird error"
+    def test_valid_payload_returns_ok(self, client):
+        resp = client.post("/webhook", headers=HEADERS, json=make_payload())
+        assert resp.json() == {"status": "ok"}
+
+
+# ═══════════════════════════════════════════
+# POST /webhook — маршрутизация уведомлений
+# ═══════════════════════════════════════════
+
+class TestWebhookRouting:
+    def test_send_to_specific_user(self, client, mock_bot_instance):
+        """user_id > 0 → отправляем конкретному пользователю."""
+        resp = client.post(
+            "/webhook",
+            headers=HEADERS,
+            json=make_payload(user_id=12345),
         )
-        # Логирует предупреждение, но не падает
-        await safe_delete_message(mock_message)
+        assert resp.status_code == 200
+        mock_bot_instance.send_message.assert_called_once()
+        call_kwargs = mock_bot_instance.send_message.call_args[1]
+        assert call_kwargs["chat_id"] == 12345
 
-    async def test_handles_generic_exception(self, mock_message):
-        mock_message.delete.side_effect = Exception("Network error")
-        await safe_delete_message(mock_message)  # не падает
+    def test_send_to_all_admins(self, client, mock_bot_instance):
+        """user_id == -1 → отправляем всем администраторам (111, 222, 333 из conftest)."""
+        resp = client.post(
+            "/webhook",
+            headers=HEADERS,
+            json=make_payload(user_id=-1),
+        )
+        assert resp.status_code == 200
+        # send_message должен быть вызван для каждого из 3 администраторов
+        assert mock_bot_instance.send_message.call_count == 3
+
+    def test_send_to_group(self, client, mock_bot_instance):
+        """user_id == 0 → отправляем в группу (group_chat_id из env = -100123456)."""
+        resp = client.post(
+            "/webhook",
+            headers=HEADERS,
+            json=make_payload(user_id=0),
+        )
+        assert resp.status_code == 200
+        mock_bot_instance.send_message.assert_called_once()
+        call_kwargs = mock_bot_instance.send_message.call_args[1]
+        assert call_kwargs["chat_id"] == -100123456
+
+    def test_admin_reservation_request_has_keyboard(self, client, mock_bot_instance):
+        """Тип 'admin_reservation_request' → добавляются кнопки быстрого действия."""
+        resp = client.post(
+            "/webhook",
+            headers=HEADERS,
+            json=make_payload(
+                user_id=-1,
+                type="admin_reservation_request",
+                book_id=42,
+            ),
+        )
+        assert resp.status_code == 200
+        # Каждый вызов send_message должен получить reply_markup
+        for call in mock_bot_instance.send_message.call_args_list:
+            assert call[1].get("reply_markup") is not None
+
+    def test_payload_too_large_returns_413(self, client):
+        """Content-Length > 1MB → 413 Payload Too Large."""
+        big_content = b"x" * (1024 * 1024 + 1)
+        resp = client.post(
+            "/webhook",
+            headers={**HEADERS, "Content-Length": str(len(big_content))},
+            content=big_content,
+        )
+        assert resp.status_code == 413
