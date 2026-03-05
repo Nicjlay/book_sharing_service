@@ -35,7 +35,7 @@ async def cmd_start(message: Message, state: FSMContext):
         # Ранее здесь была локальная escape_html_simple, которая не экранировала «"»,
         # что создавало расхождение с форматтерами в других частях бота.
         welcome_text = (
-            f"👋 Привет, {escape_html(full_name)}!\n\n"
+            f"👋 Приветствую, {escape_html(full_name)}!\n\n"
             f"📚 Добро пожаловать в <b>Библиотеку</b> — бот для обмена и учёта книг.\n\n"
             f"Здесь вы можете:\n"
             f"• 📖 Просматривать каталог книг\n"
