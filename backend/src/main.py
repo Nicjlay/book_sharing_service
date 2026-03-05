@@ -958,7 +958,13 @@ async def trigger_backup_to_admin(
     db_name = os.getenv("POSTGRES_DB", "library_db")
     db_host = "db"
     filename = f"backup_{db_name}_{int(time.time())}.sql"
+    # Достаем пароль из переменных окружения (убедись, что POSTGRES_PASSWORD есть в .env)
+    db_password = os.getenv("POSTGRES_PASSWORD", "твой_дефолтный_пароль_если_нужно")
 
+    # Копируем текущие переменные окружения системы и добавляем туда пароль для Postgres
+    env = os.environ.copy()
+    env["PGPASSWORD"] = db_password
+    
     try:
         # 3. Генерация дампа через pg_dump
         # Мы используем asyncio, чтобы не блокировать основной поток API
@@ -966,6 +972,7 @@ async def trigger_backup_to_admin(
             "pg_dump", "-U", db_user, "-h", db_host, db_name,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=env,
         )
         stdout, stderr = await process.communicate()
 
